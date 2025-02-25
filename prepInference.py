@@ -9,16 +9,16 @@ from monai.transforms import Compose, LoadImaged, EnsureChannelFirstd, EnsureTyp
 from monai.data import Dataset, DataLoader, decollate_batch
 
 def create_test_loader(uploaded_files):
-    """ Crea un DataLoader MONAI dai file caricati dall'utente """
+    # DataLoader MONAI dai file caricati dall'utente
     sequence_types = ["T1CE", "T1", "T2", "FLAIR"]
     selected_files = {}
 
-    # Mappa i file ai tipi di sequenza
+    # Mapping dei file ai tipi di sequenza
     for file in uploaded_files:
         selected_type = st.selectbox(f"Seleziona il tipo per {file.name}", sequence_types, key=file.name)
         selected_files[selected_type] = file
 
-    # Assicuriamoci che siano stati assegnati tutti e quattro i tipi di file
+   
     if set(selected_files.keys()) != set(sequence_types):
         st.warning("Assegna correttamente tutti i file NIfTI ai loro tipi.")
         return None
@@ -34,7 +34,7 @@ def create_test_loader(uploaded_files):
         AdjustContrastd(keys=["t2", "flair"], gamma=1.1)
     ])
 
-    # Creiamo un dizionario con i file caricati
+    # Dizionario con i file caricati 
     datalist = {
         "inference": [
             {
@@ -46,7 +46,7 @@ def create_test_loader(uploaded_files):
         ]
     }
 
-    # Creazione del dataset e DataLoader
+    # Dataset e DataLoader
     test_dataset = Dataset(data=datalist["inference"], transform=val_transform)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
