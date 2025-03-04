@@ -142,7 +142,7 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
     
     
     def populateVolumeSelector(self, comboBox):
-        """Riempie la combo box con solo i percorsi completi dei volumi caricati in Slicer."""
+        
         comboBox.clear() 
         volumeNodes = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
 
@@ -153,7 +153,7 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
                 comboBox.addItem(filePath, node) 
 
     def onConfirmSelection(self):
-        """Memorizza i volumi selezionati, li rinomina con i nomi standard e li passa alla logica."""
+       
         for modality, comboBox in self.volumeSelectors.items():
             selectedIndex = comboBox.currentIndex  
             
@@ -165,12 +165,11 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
     
 
                     if existingNode and existingNode == selectedNode:
-                        print(f"Il nodo '{modality}' è già corretto. Nessuna modifica necessaria.")  
+                        
                         continue
     
 
-                    if selectedNode.GetName() != modality:
-                        print(f"Rinominazione: '{selectedNode.GetName()}' → '{modality}'")  
+                    if selectedNode.GetName() != modality:  
                         selectedNode.SetName(modality) 
     
                     self.inputVolumes[modality] = selectedNode  
@@ -178,8 +177,7 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
                     print(f"Errore: Nessun nodo selezionato per {modality}") 
                     qt.QMessageBox.warning(self.parent, "Selection Error", f"Please select a volume for {modality}.")
                     return
-    
-        print("Nodi rinominati:", {k: v.GetName() for k, v in self.inputVolumes.items()})  
+      
         qt.QMessageBox.information(self.parent, "Volumes Selected", "Volumes successfully selected and renamed!")
                 
     def onPreprocessingButton(self):
