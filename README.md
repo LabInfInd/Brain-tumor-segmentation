@@ -24,12 +24,12 @@
      
 <img width="409" alt="Screenshot 2025-03-04 alle 15 39 54" src="https://github.com/user-attachments/assets/d512d75c-e94b-48a7-94df-a2b32278bbd9" />
 
-   - Copy the code below:
+   - Copy and paste the code below:
      
-    ```python
+    
     >>> import pip
     >>> pip.main(['install', 'torch', 'monai[nibabel]'])
-    ```
+    
     
 
 
