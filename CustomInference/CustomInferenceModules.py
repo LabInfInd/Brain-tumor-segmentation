@@ -423,7 +423,7 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
                 slicer.util.updateSegmentBinaryLabelmapFromArray(mask, segmentationNode, segmentId, referenceVolume)
                 segmentationNode.GetSegmentation().GetSegment(segmentId).SetColor(colors[i])
         
-            slicer.mrmlScene.AddNode(segmentationNode)
+            
             slicer.app.processEvents()
         
             segmentationDisplayNode = segmentationNode.GetDisplayNode()
