@@ -199,7 +199,7 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
                 filePath = storageNode.GetFileName()
                 comboBox.addItem(filePath, node) 
             else:
-                # Se il nodo non ha uno StorageNode, stampiamo un messaggio di avviso
+                
                 print(f"Il nodo {node.GetName()} non ha uno StorageNode o un percorso associato.")
         slicer.app.processEvents()
 
