@@ -152,9 +152,9 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
         
         currentVolumeNodes = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
         
-        # Confronta i volumi attuali con quelli già presenti
+        
         if len(currentVolumeNodes) != len(self.volumeNodes):
-            self.updateComboBoxes()  # Se il numero dei nodi è cambiato, aggiorna i ComboBox
+            self.updateComboBoxes()  
 
         self.volumeNodes = currentVolumeNodes
     
