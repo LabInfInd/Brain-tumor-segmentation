@@ -323,26 +323,3 @@ class VNetMultiEncoder(nn.Module):
         outputs = self.final_conv(c7)
         #print("outputs shape:", outputs.shape)
         return outputs
-"""   
-class VNetMultiEncoderModule(ScriptedLoadableModule):
-    def __init__(self, parent):
-        ScriptedLoadableModule.__init__(self, parent)
-        self.parent.title = "VNetMultiEncoder"
-        self.parent.categories = ["Segmentation"]
-        self.parent.dependencies = []
-        self.parent.contributors = ["Tuo Nome (Tua Organizzazione)"]
-        self.parent.helpText = #Modulo Slicer per eseguire inferenza con VNetMultiEncoder.
-
-
-    def setup(self):
-        print("Modulo VNetMultiEncoder caricato correttamente.")
-
-    def runInference(self, inputTensor):
-       
-        model = VNetMultiEncoder(input_channels=1)  # Inizializza il modello
-        model.eval()  # Imposta in modalità valutazione
-
-        with torch.no_grad():  # Disabilita il calcolo del gradiente per l'inferenza
-            output = model(*inputTensor)  # Passa gli input
-        return output
-"""
