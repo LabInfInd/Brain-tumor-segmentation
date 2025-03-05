@@ -8,17 +8,20 @@
 2. Unzip in a folder of your choice on your computer
 
 3. Open 3D Slicer
+4. Check if General Registration (BRAINS) extension is installed (Modules -> Registration). If not, install it from the extension manager
+5. Install "swissskullstripping" extension from the extension manager
+6. Restart Slicer
    
-5. Import module in 3D Slicer:
+7. Import module in 3D Slicer:
 
-   - Modules —> Developer Tools —> Extension Wizard 
-<img width="528" alt="Screenshot 2025-03-04 alle 15 38 37" src="https://github.com/user-attachments/assets/b15e649e-86c2-4b5a-8203-c8d582d3ab6c" />
+   - Slicer -> Edit -> Application Settings -> Modules -> Additional module paths
+   - Add path to the "CustomInference" folder
+  
+<img width="1454" alt="Screenshot 2025-03-05 alle 11 17 39" src="https://github.com/user-attachments/assets/e25676f1-11f8-4eb2-84d0-fdeb5202aa0a" />
 
-
-   - Select Extension —> Choose code folder —> Open
-   - Now you can see the Extension CUSTOM INFERENCE MODULE in the Module list
-
-6. Import independent python modules
+   - Save changes
+   - Restart Slicer
+8. Import independent python modules
 
    - Open Python Console
      
@@ -28,7 +31,7 @@
      
     
     >>> import pip
-    >>> pip.main(['install', 'torch', 'monai[nibabel]'])
+    >>> pip.main(['install', 'numpy', 'torch', 'monai[nibabel]'])
     
     
 
