@@ -6,7 +6,6 @@ Created on Wed Feb 26 10:27:14 2025
 """
 
 
-
 import os
 import torch
 import numpy as np
@@ -33,7 +32,10 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
     def __init__(self, parent=None):
         ScriptedLoadableModuleWidget.__init__(self, parent)
         self.inputVolumes = {}  
+        self.sceneObservers = []
         self.logic = CustomInferenceModulesLogic()  
+        self.volumeSelectors = {}
+        self.volumeNodes = []
 
     def setup(self):
         ScriptedLoadableModuleWidget.setup(self)
@@ -56,7 +58,7 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
 
 
 
-        self.volumeSelectors = {}
+       
 
         for modality in ["T1", "T2", "T1CE", "FLAIR"]:
             rowLayout = qt.QHBoxLayout()
@@ -68,18 +70,27 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
             comboBox.setSizePolicy(qt.QSizePolicy.Expanding, qt.QSizePolicy.Fixed)  
 
 
-            self.populateVolumeSelector(comboBox)
+            #self.populateVolumeSelector(comboBox)
 
             rowLayout.addWidget(comboBox)
             self.volumeSelectors[modality] = comboBox
 
             
             self.layout.addLayout(rowLayout)
-            
-        self.updateComboBoxes()
-        slicer.mrmlScene.AddObserver(slicer.vtkMRMLScene.NodeAddedEvent, self.onNodeAdded)
-        slicer.mrmlScene.AddObserver(slicer.vtkMRMLScene.NodeRemovedEvent, self.onNodeRemoved)
 
+        self.updateComboBoxes()
+        
+
+        
+        self.timer = qt.QTimer()
+        self.timer.timeout.connect(self.checkForNewVolumes)
+        self.timer.start(1000)  # Controlla ogni secondo
+       
+    
+      
+        
+    
+        
 
         self.confirmSelectionButton = qt.QPushButton("Confirm Selection")
         self.layout.addWidget(self.confirmSelectionButton)
@@ -91,6 +102,7 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
         self.layout.addWidget(titleLabel)
         self.skullstrippingButton = qt.QPushButton("Run Skullstripping")
         self.layout.addWidget(self.skullstrippingButton)
+        self.skullstrippingButton.setEnabled(False) 
         self.skullstrippingButton.connect('clicked(bool)', self.onSkullStrippingButton)
         
         
@@ -99,6 +111,7 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
         self.layout.addWidget(titleLabel)
         self.preprocessingButton = qt.QPushButton("Run Preprocessing")
         self.layout.addWidget(self.preprocessingButton)
+        self.preprocessingButton.setEnabled(False)
         self.preprocessingButton.connect('clicked(bool)', self.onPreprocessingButton)
         
         
@@ -111,12 +124,14 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
         self.layout.addWidget(titleLabel)
         self.inferenceButton = qt.QPushButton("Run Inference")
         self.layout.addWidget(self.inferenceButton)
+        self.inferenceButton.setEnabled(False)
         self.inferenceButton.connect('clicked(bool)', self.onInferenceButton)
         
         
 
         self.modifySegmentationButton = qt.QPushButton("Modify Segmentation")
         self.layout.addWidget(self.modifySegmentationButton)
+        self.modifySegmentationButton.setEnabled(False)
         self.modifySegmentationButton.connect('clicked(bool)', self.onModifySegmentation)
         
 
@@ -128,23 +143,40 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
        
         
         self.layout.addStretch(1)
+        
+    def updateComboBoxes(self):      
+        for comboBox in self.volumeSelectors.values():
+            self.populateVolumeSelector(comboBox)
+    
+    def checkForNewVolumes(self):
+        
+        currentVolumeNodes = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
+        
+        # Confronta i volumi attuali con quelli già presenti
+        if len(currentVolumeNodes) != len(self.volumeNodes):
+            self.updateComboBoxes()  # Se il numero dei nodi è cambiato, aggiorna i ComboBox
 
+        self.volumeNodes = currentVolumeNodes
+    
+    def addSceneObservers(self):
+        
+        self.removeSceneObservers() 
+    
+        observer1 = slicer.mrmlScene.AddObserver(slicer.vtkMRMLScene.NodeAddedEvent, self.onSceneUpdated)
+        observer2 = slicer.mrmlScene.AddObserver(slicer.vtkMRMLScene.NodeRemovedEvent, self.onSceneUpdated)
+        #observer3 = slicer.mrmlScene.AddObserver(slicer.vtkMRMLScene.ModifiedEvent, self.onSceneUpdated)
+    
+        self.sceneObservers.append(observer1)
+        self.sceneObservers.append(observer2)
+
+   
+        
     def onLoadModelButton(self):
         modelFolderPath = qt.QFileDialog.getExistingDirectory(self.parent, "Select Model Directory")
         if modelFolderPath:
             self.logic.loadModels(modelFolderPath)
             qt.QMessageBox.information(self.parent, "Model Loaded", "Modelli caricati con successo.")
-            
-    def updateComboBoxes(self):    
-        for comboBox in self.volumeSelectors.values():
-            self.populateVolumeSelector(comboBox)
-    
-    def onNodeAdded(self, caller, event):  
-        self.updateComboBoxes()
-    
-    def onNodeRemoved(self, caller, event):
-        self.updateComboBoxes()
-        
+
     def onLoadVolume(self, modality):
         fileDialog = qt.QFileDialog()
         fileDialog.setFileMode(qt.QFileDialog.ExistingFile)
@@ -159,15 +191,20 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
         
         comboBox.clear() 
         volumeNodes = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
-
+        
+        
         for node in volumeNodes:
             storageNode = node.GetStorageNode()
             if storageNode and storageNode.GetFileName():
                 filePath = storageNode.GetFileName()
                 comboBox.addItem(filePath, node) 
+            else:
+                # Se il nodo non ha uno StorageNode, stampiamo un messaggio di avviso
+                print(f"Il nodo {node.GetName()} non ha uno StorageNode o un percorso associato.")
+        slicer.app.processEvents()
 
     def onConfirmSelection(self):
-       
+        
         for modality, comboBox in self.volumeSelectors.items():
             selectedIndex = comboBox.currentIndex  
             
@@ -183,7 +220,8 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
                         continue
     
 
-                    if selectedNode.GetName() != modality:  
+                    if selectedNode.GetName() != modality:
+                        
                         selectedNode.SetName(modality) 
     
                     self.inputVolumes[modality] = selectedNode  
@@ -191,8 +229,13 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
                     print(f"Errore: Nessun nodo selezionato per {modality}") 
                     qt.QMessageBox.warning(self.parent, "Selection Error", f"Please select a volume for {modality}.")
                     return
-      
+    
+        
         qt.QMessageBox.information(self.parent, "Volumes Selected", "Volumes successfully selected and renamed!")
+        self.skullstrippingButton.setEnabled(True)
+        self.preprocessingButton.setEnabled(True)
+        self.inferenceButton.setEnabled(True)
+        self.modifySegmentationButton.setEnabled(True)
                 
     def onPreprocessingButton(self):
         modalities = ["T1", "T2", "T1CE", "FLAIR"]
@@ -247,7 +290,26 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
                 print(f"Il volume {modality} non è stato trovato, salto...")
                 continue
     
+            originalNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", f"{modality}_original")
+
            
+            originalNode.Copy(imageNode)  
+            
+            newStorageNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLVolumeArchetypeStorageNode")
+            
+            storageNode = imageNode.GetStorageNode()
+            
+            if storageNode:
+                
+                originalNode.SetAndObserveStorageNodeID(newStorageNode.GetID())  
+            
+                
+                filePath = storageNode.GetFileName()
+                newStorageNode.SetFileName(filePath)  
+            
+            
+            originalNode.SetName(f"{modality}_original") 
+
             maskVolumeNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", f"{modality}_brainmask")
     
 
@@ -260,7 +322,7 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
             cliModule = slicer.modules.swissskullstripper
             cliNode = slicer.cli.runSync(cliModule, None, parameters)
     
-          
+        self.checkForNewVolumes()
         print("Skull Stripping eseguito")
     
 
@@ -322,95 +384,91 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
             self.models.append(model)
 
     
-          
+    
     def runInference(self):
         if not self.models:
             qt.QMessageBox.warning(None, "Error", "No models loaded. Load models before running inference.")
             return
-        
-        progressDialog = qt.QProgressDialog("Inferenza in corso...", None, 0, 100)
-        progressDialog.setWindowTitle("Inferenza")
+    
+        progressDialog = qt.QProgressDialog("Please wait ...", None, 0, 0)  # Barra indeterminata
+        progressDialog.setWindowTitle("Caricamento in corso")
         progressDialog.setCancelButton(None)
+        progressDialog.setMinimumWidth(300) 
+        progressDialog.setMinimumHeight(50)  
         progressDialog.show()
-        
         slicer.app.processEvents()
-        
+    
         sequence_names = ["T1", "T2", "T1CE", "FLAIR"]
-        
-        # Funzione per ottenere un volume da 3D Slicer come array NumPy
+    
         def get_slicer_volume_as_numpy(volume_name):
-            volume_node = slicer.util.getNode(volume_name)  
-            image_data = slicer.util.arrayFromVolume(volume_node) 
-            return np.moveaxis(image_data, 0, -1), volume_node  # Riordina gli assi (Z, Y, X diventa  X, Y, Z)
-        
-        # Estrarre i dati da Slicer
+            volume_node = slicer.util.getNode(volume_name)
+            image_data = slicer.util.arrayFromVolume(volume_node)
+            return np.moveaxis(image_data, 0, -1), volume_node  # Riordina gli assi
+    
         image_dict = {}
         for seq in sequence_names:
             image_numpy, _ = get_slicer_volume_as_numpy(seq)
             image_dict[seq] = np.expand_dims(image_numpy, axis=0)
-        
-        # Creare una lista di dizionari per MONAI
-        data_list = [{"T1": image_dict["T1"], "T2": image_dict["T2"], 
+    
+        data_list = [{"T1": image_dict["T1"], "T2": image_dict["T2"],
                       "T1CE": image_dict["T1CE"], "FLAIR": image_dict["FLAIR"]}]
         dataset = Dataset(data=data_list, transform=self.transforms)
         dataloader = DataLoader(dataset, batch_size=1)
-        
-        steps_per_model = 50  
-        total_steps = len(self.models) * steps_per_model + 40 
+    
+        steps_per_model = 50
+        total_steps = len(self.models) * steps_per_model + 40
         current_step = 0
-        
+    
         def update_progress_bar(step_increment):
             nonlocal current_step
+            if progressDialog.minimum == 0 and progressDialog.maximum == 0:
+                progressDialog.setRange(0, 100)  # Passa alla barra determinata
             current_step += step_increment
             progressDialog.setValue(int((current_step / total_steps) * 100))
             slicer.app.processEvents()
-        
+    
         for i, batch in enumerate(dataloader):
             with torch.no_grad():
                 inputs = {key: batch[key].to(self.device) for key in ["T1CE", "T1", "T2", "FLAIR"]}
-        
+    
                 all_predictions = []
                 for j, model in enumerate(self.models):
                     test_output = model(inputs["T1CE"], inputs["T1"], inputs["T2"], inputs["FLAIR"])
                     test_output = [self.post_trans(i) for i in decollate_batch(test_output)]
                     all_predictions.append(torch.stack(test_output))
-                    
-                    for _ in range(10):
-                        update_progress_bar(5)
-        
+                    update_progress_bar(200 // len(self.models))
+    
                 all_predictions = torch.stack(all_predictions)
                 final_prediction = torch.mode(all_predictions, dim=0)[0]
-        
-                for _ in range(10):
-                    update_progress_bar(2)
-        
+                update_progress_bar(10)
+    
                 preprocessed_volumes = {}
                 for key in ["T1CE", "T1", "T2", "FLAIR"]:
-                    referenceVolume = slicer.util.getNode(key) 
-                    preprocessed_array = batch[key].squeeze()  
-                    print(f"Shape del volume preprocessato {key} prima della trasposta:", preprocessed_array.shape)
-                    
-                    preprocessed_array = np.transpose(preprocessed_array, (2, 0, 1))  
-                    print(f"Shape del volume preprocessato {key}:", preprocessed_array.shape)
-        
+                    referenceVolume = slicer.util.getNode(key)
+                    preprocessed_array = batch[key].squeeze()
+                    preprocessed_array = np.transpose(preprocessed_array, (2, 0, 1))
+    
                     newVolume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", f"{key}_Preprocessed")
                     slicer.util.updateVolumeFromArray(newVolume, preprocessed_array)
-                    newVolume.SetOrigin(referenceVolume.GetOrigin())  #nuove
+                    newVolume.SetOrigin(referenceVolume.GetOrigin())
                     newVolume.SetSpacing(referenceVolume.GetSpacing())
                     directionMatrix = vtk.vtkMatrix4x4()
                     referenceVolume.GetIJKToRASDirectionMatrix(directionMatrix)
                     newVolume.SetIJKToRASDirectionMatrix(directionMatrix)
- 
                     preprocessed_volumes[key] = newVolume
-        
+    
                     update_progress_bar(5)
-        
+    
                 mask_array = final_prediction.cpu().numpy().squeeze()
                 self.createSegmentationNode(mask_array, preprocessed_volumes)
                 update_progress_bar(10)
-        
+    
         progressDialog.setValue(100)
         slicer.app.processEvents()
+        
+
+        
+    
         
     def createSegmentationNode(self, mask_array, preprocessed_volumes):
             referenceVolume = preprocessed_volumes["T1CE"]
@@ -437,7 +495,7 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
                 slicer.util.updateSegmentBinaryLabelmapFromArray(mask, segmentationNode, segmentId, referenceVolume)
                 segmentationNode.GetSegmentation().GetSegment(segmentId).SetColor(colors[i])
         
-            
+            #slicer.mrmlScene.AddNode(segmentationNode)
             slicer.app.processEvents()
         
             segmentationDisplayNode = segmentationNode.GetDisplayNode()
@@ -475,7 +533,7 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
 
         slicer.app.processEvents()
         
-    
+  
    
         
         
