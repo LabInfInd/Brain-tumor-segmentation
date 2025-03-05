@@ -36,6 +36,7 @@
     
 
 
-6. Download the trained model: *LINK*
+6. Download the trained model folder here: [Model](https://drive.google.com/drive/folders/1zyauzbkUiraO2vhI-AeAP7jT8DQyq1ET?usp=sharing)
+
 
 
