@@ -75,6 +75,10 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
 
             
             self.layout.addLayout(rowLayout)
+            
+        self.updateComboBoxes()
+        slicer.mrmlScene.AddObserver(slicer.vtkMRMLScene.NodeAddedEvent, self.onNodeAdded)
+        slicer.mrmlScene.AddObserver(slicer.vtkMRMLScene.NodeRemovedEvent, self.onNodeRemoved)
 
 
         self.confirmSelectionButton = qt.QPushButton("Confirm Selection")
@@ -130,7 +134,17 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
         if modelFolderPath:
             self.logic.loadModels(modelFolderPath)
             qt.QMessageBox.information(self.parent, "Model Loaded", "Modelli caricati con successo.")
-
+            
+    def updateComboBoxes(self):    
+        for comboBox in self.volumeSelectors.values():
+            self.populateVolumeSelector(comboBox)
+    
+    def onNodeAdded(self, caller, event):  
+        self.updateComboBoxes()
+    
+    def onNodeRemoved(self, caller, event):
+        self.updateComboBoxes()
+        
     def onLoadVolume(self, modality):
         fileDialog = qt.QFileDialog()
         fileDialog.setFileMode(qt.QFileDialog.ExistingFile)
