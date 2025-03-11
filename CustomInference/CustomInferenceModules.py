@@ -5,7 +5,6 @@ Created on Wed Feb 26 10:27:14 2025
 @author: Utente
 """
 
-
 import os
 import torch
 import numpy as np
@@ -36,6 +35,7 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
         self.logic = CustomInferenceModulesLogic()  
         self.volumeSelectors = {}
         self.volumeNodes = []
+        
 
     def setup(self):
         ScriptedLoadableModuleWidget.setup(self)
@@ -70,7 +70,7 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
             comboBox.setSizePolicy(qt.QSizePolicy.Expanding, qt.QSizePolicy.Fixed)  
 
 
-            #self.populateVolumeSelector(comboBox)
+            
 
             rowLayout.addWidget(comboBox)
             self.volumeSelectors[modality] = comboBox
@@ -152,7 +152,6 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
         
         currentVolumeNodes = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
         
-        
         if len(currentVolumeNodes) != len(self.volumeNodes):
             self.updateComboBoxes()  
 
@@ -160,7 +159,7 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
     
     def addSceneObservers(self):
         
-        self.removeSceneObservers() 
+        self.removeSceneObservers()  
     
         observer1 = slicer.mrmlScene.AddObserver(slicer.vtkMRMLScene.NodeAddedEvent, self.onSceneUpdated)
         observer2 = slicer.mrmlScene.AddObserver(slicer.vtkMRMLScene.NodeRemovedEvent, self.onSceneUpdated)
@@ -198,9 +197,7 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
             if storageNode and storageNode.GetFileName():
                 filePath = storageNode.GetFileName()
                 comboBox.addItem(filePath, node) 
-            else:
-                
-                print(f"Il nodo {node.GetName()} non ha uno StorageNode o un percorso associato.")
+            
         slicer.app.processEvents()
 
     def onConfirmSelection(self):
@@ -292,22 +289,23 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
     
             originalNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", f"{modality}_original")
 
-           
-            originalNode.Copy(imageNode)  
             
+            originalNode.Copy(imageNode)  
+         
             newStorageNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLVolumeArchetypeStorageNode")
             
+         
             storageNode = imageNode.GetStorageNode()
             
             if storageNode:
                 
                 originalNode.SetAndObserveStorageNodeID(newStorageNode.GetID())  
             
-                
+               
                 filePath = storageNode.GetFileName()
                 newStorageNode.SetFileName(filePath)  
             
-            
+           
             originalNode.SetName(f"{modality}_original") 
 
             maskVolumeNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", f"{modality}_brainmask")
@@ -362,6 +360,7 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
     def __init__(self):
         self.models = []
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.updatingSlice = False
 
 
         self.transforms = Compose([
@@ -495,7 +494,7 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
                 slicer.util.updateSegmentBinaryLabelmapFromArray(mask, segmentationNode, segmentId, referenceVolume)
                 segmentationNode.GetSegmentation().GetSegment(segmentId).SetColor(colors[i])
         
-            #slicer.mrmlScene.AddNode(segmentationNode)
+
             slicer.app.processEvents()
         
             segmentationDisplayNode = segmentationNode.GetDisplayNode()
@@ -504,7 +503,11 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
             segmentationDisplayNode.SetVisibility3D(True)
             
             self.updateSliceViewerLayers(preprocessed_volumes, segmentationNode)
-            
+                
+   
+    
+   
+
     def updateSliceViewerLayers(self, preprocessed_volumes=None, segmentationNode=None):
         if preprocessed_volumes is None:
             try:
@@ -518,22 +521,54 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
             except slicer.util.MRMLNodeNotFoundException as e:
                 qt.QMessageBox.warning(None, "Error", str(e))
                 return
+    
         
-       
-        for sliceViewName in ['Red', 'Green', 'Yellow']:
+        volumeNode = preprocessed_volumes["T1CE"]
+    
+        
+        view_orientation_map = {
+            'Red': 'Axial',
+            'Green': 'Coronal',
+            'Yellow': 'Sagittal'
+        }
+    
+        for sliceViewName, defaultOrientation in view_orientation_map.items():
             sliceWidget = slicer.app.layoutManager().sliceWidget(sliceViewName)
             sliceLogic = sliceWidget.sliceLogic()
             sliceCompositeNode = sliceLogic.GetSliceCompositeNode()
-            sliceCompositeNode.SetBackgroundVolumeID(preprocessed_volumes["T1CE"].GetID())
+            sliceNode = sliceLogic.GetSliceNode()
+    
+           
+            sliceCompositeNode.SetBackgroundVolumeID(volumeNode.GetID())
             sliceCompositeNode.SetForegroundVolumeID(segmentationNode.GetID())
             sliceCompositeNode.SetForegroundOpacity(0.5)
-
+    
+         
+            sliceNode.SetOrientation(defaultOrientation)
+            sliceNode.RotateToVolumePlane(volumeNode)
             sliceLogic.FitSliceToAll()
     
 
-        slicer.app.processEvents()
-        
-  
+            def createOrientationCallback(sliceNode, sliceLogic, volumeNode, defaultOrientation):
+                def onOrientationChanged(caller, event):
+                    currentOrientation = sliceNode.GetOrientationString()
+                    if currentOrientation in ["Axial", "Sagittal", "Coronal"]:
+                        sliceNode.RotateToVolumePlane(volumeNode)
+                        sliceLogic.FitSliceToAll()
+                return onOrientationChanged
+    
+
+            observerTag = getattr(sliceNode, "_orientationObserver", None)
+            if observerTag is not None:
+                sliceNode.RemoveObserver(observerTag)
+
+            observerTag = sliceNode.AddObserver(vtk.vtkCommand.ModifiedEvent, createOrientationCallback(sliceNode, sliceLogic, volumeNode, defaultOrientation))
+            setattr(sliceNode, "_orientationObserver", observerTag)
+    
+        slicer.app.processEvents() 
+
+
+
    
         
         
