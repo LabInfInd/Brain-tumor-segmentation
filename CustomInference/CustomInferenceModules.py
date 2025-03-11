@@ -333,22 +333,40 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
         slicer.util.selectModule('CustomInferenceModules')
     
 
-
-    def onModifySegmentation(self):
-        segmentationNode = slicer.util.getNode('Segmentation')
-        referenceVolume = slicer.util.getNode("T1CE_Preprocessed") 
-        if segmentationNode:
-            slicer.modules.segmenteditor.widgetRepresentation().show()
-            slicer.util.selectModule('SegmentEditor')
-            slicer.util.setSliceViewerLayers(foreground=segmentationNode)
     
-
-            editorWidget = slicer.modules.segmenteditor.widgetRepresentation()
-            layout = editorWidget.layout()
-            layout.addWidget(self.returnToMainButton)
-            self.returnToMainButton.show()
-        else:
+    def onModifySegmentation(self): 
+        segmentationNode = slicer.util.getNode('Segmentation')
+    
+        if not segmentationNode:
             qt.QMessageBox.warning(None, "Errore", "Nessuna segmentazione trovata.")
+            return
+    
+      
+        self.logic.disableSliceObservers()
+    
+       
+        slicer.util.selectModule('SegmentEditor')
+    
+       
+        slicer.app.processEvents()
+    
+        
+        slicer.modules.segmenteditor.widgetRepresentation().show()
+    
+        
+        editorWidget = slicer.modules.segmenteditor.widgetRepresentation()
+        layout = editorWidget.layout()
+        layout.addWidget(self.returnToMainButton)
+        self.returnToMainButton.show()
+    
+        
+        self.logic.enableSliceObservers()
+        self.logic.forceSliceRealignment()
+    
+        slicer.app.processEvents()
+
+
+
     
             
         
@@ -381,6 +399,57 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
             model.load_state_dict(torch.load(modelPath, map_location=self.device), strict=False)
             model.eval()
             self.models.append(model)
+    
+    def disableSliceObservers(self):
+        
+        for sliceViewName in ['Red', 'Green', 'Yellow']:
+            sliceWidget = slicer.app.layoutManager().sliceWidget(sliceViewName)
+            sliceNode = sliceWidget.sliceLogic().GetSliceNode()
+            observerTag = getattr(sliceNode, "_orientationObserver", None)
+            if observerTag is not None:
+                sliceNode.RemoveObserver(observerTag)
+                setattr(sliceNode, "_orientationObserver", None)  
+    
+    def enableSliceObservers(self):
+        
+        try:
+            preprocessed_volumes = {key: slicer.util.getNode(f'{key}_Preprocessed') for key in ["T1CE", "T1", "T2", "FLAIR"]}
+            segmentationNode = slicer.util.getNode('Segmentation')
+        except slicer.util.MRMLNodeNotFoundException as e:
+            qt.QMessageBox.warning(None, "Error", str(e))
+            return
+    
+        self.updateSliceViewerLayers(preprocessed_volumes, segmentationNode)  
+        slicer.app.processEvents()
+        self.forceSliceRealignment()
+ 
+        
+    def forceSliceRealignment(self):
+    
+        volumeNode = slicer.util.getNode("T1CE_Preprocessed")
+        if not volumeNode:
+            return
+    
+        view_orientation_map = {
+            'Red': 'Axial',
+            'Green': 'Coronal',
+            'Yellow': 'Sagittal'
+        }
+    
+        for sliceViewName, orientation in view_orientation_map.items():
+            sliceWidget = slicer.app.layoutManager().sliceWidget(sliceViewName)
+            sliceLogic = sliceWidget.sliceLogic()
+            sliceNode = sliceLogic.GetSliceNode()
+    
+            
+            if sliceNode.GetOrientationString() in ["Axial", "Sagittal", "Coronal"]:
+                sliceNode.SetOrientation(orientation)
+                sliceNode.RotateToVolumePlane(volumeNode)
+                sliceLogic.FitSliceToAll()
+        
+        slicer.app.processEvents()
+
+
 
     
     
@@ -509,12 +578,12 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
    
 
     def updateSliceViewerLayers(self, preprocessed_volumes=None, segmentationNode=None):
-        if preprocessed_volumes is None:
-            try:
-                preprocessed_volumes = {key: slicer.util.getNode(f'Preprocessed_{key}') for key in ["T1CE", "T1", "T2", "FLAIR"]}
-            except slicer.util.MRMLNodeNotFoundException as e:
-                qt.QMessageBox.warning(None, "Error", str(e))
-                return
+        #if preprocessed_volumes is None:
+            #try:
+                #preprocessed_volumes = {key: slicer.util.getNode(f'Preprocessed_{key}') for key in ["T1CE", "T1", "T2", "FLAIR"]}
+            #except slicer.util.MRMLNodeNotFoundException as e:
+                #qt.QMessageBox.warning(None, "Error", str(e))
+                #return
         if segmentationNode is None:
             try:
                 segmentationNode = slicer.util.getNode('Segmentation')
@@ -566,7 +635,6 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
             setattr(sliceNode, "_orientationObserver", observerTag)
     
         slicer.app.processEvents() 
-
 
 
    
