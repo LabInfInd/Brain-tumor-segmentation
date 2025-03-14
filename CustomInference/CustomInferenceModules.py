@@ -15,6 +15,9 @@ from slicer.ScriptedLoadableModule import *
 import slicer
 import vtk, qt, ctk
 import time
+import torch.nn.functional as F
+
+import SimpleITK as sitk
 from VNetModel.VNetModel import VNetMultiEncoder
 
 class CustomInferenceModules(ScriptedLoadableModule):
@@ -230,9 +233,9 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
         
         qt.QMessageBox.information(self.parent, "Volumes Selected", "Volumes successfully selected and renamed!")
         self.skullstrippingButton.setEnabled(True)
-        self.preprocessingButton.setEnabled(True)
-        self.inferenceButton.setEnabled(True)
-        self.modifySegmentationButton.setEnabled(True)
+        #self.preprocessingButton.setEnabled(True)
+        #self.inferenceButton.setEnabled(True)
+        #self.modifySegmentationButton.setEnabled(True)
                 
     def onPreprocessingButton(self):
         modalities = ["T1", "T2", "T1CE", "FLAIR"]
@@ -275,6 +278,7 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
             
     
         print("Volumi registrati e sovrascritti")
+        self.inferenceButton.setEnabled(True)
         
     
     def onSkullStrippingButton(self):
@@ -322,12 +326,15 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
     
         self.checkForNewVolumes()
         print("Skull Stripping eseguito")
+        self.preprocessingButton.setEnabled(True)
+        
     
 
 
     def onInferenceButton(self):
         
         self.logic.runInference()
+        self.modifySegmentationButton.setEnabled(True)
 
     def onReturnToMainButton(self):
         slicer.util.selectModule('CustomInferenceModules')
@@ -335,35 +342,38 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
 
     
     def onModifySegmentation(self): 
-        segmentationNode = slicer.util.getNode('Segmentation')
+        # Trova la segmentazione attiva (quella visibile)
+        segmentationNodes = slicer.util.getNodesByClass("vtkMRMLSegmentationNode")
+        activeSegmentation = None
     
-        if not segmentationNode:
-            qt.QMessageBox.warning(None, "Errore", "Nessuna segmentazione trovata.")
+        for segNode in segmentationNodes:
+            if segNode.GetDisplayNode().GetVisibility():  # Segmentazione visibile
+                activeSegmentation = segNode
+                break
+    
+        if not activeSegmentation:
+            qt.QMessageBox.warning(None, "Errore", "Nessuna segmentazione visibile trovata.")
             return
     
-      
+        # Disabilita gli osservatori dei slice per evitare aggiornamenti indesiderati
         self.logic.disableSliceObservers()
     
-       
+        # Seleziona il modulo SegmentEditor
         slicer.util.selectModule('SegmentEditor')
-    
-       
         slicer.app.processEvents()
     
-        
-        slicer.modules.segmenteditor.widgetRepresentation().show()
-    
-        
+        # Mostra il pannello di modifica della segmentazione
         editorWidget = slicer.modules.segmenteditor.widgetRepresentation()
         layout = editorWidget.layout()
         layout.addWidget(self.returnToMainButton)
         self.returnToMainButton.show()
     
-        
+        # Abilita gli osservatori e riallinea le slice
         self.logic.enableSliceObservers()
         self.logic.forceSliceRealignment()
     
         slicer.app.processEvents()
+
 
 
 
@@ -410,24 +420,83 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
                 sliceNode.RemoveObserver(observerTag)
                 setattr(sliceNode, "_orientationObserver", None)  
     
-    def enableSliceObservers(self):
         
+    def enableSliceObservers(self):
         try:
-            preprocessed_volumes = {key: slicer.util.getNode(f'{key}_Preprocessed') for key in ["T1CE", "T1", "T2", "FLAIR"]}
-            segmentationNode = slicer.util.getNode('Segmentation')
+            # Creiamo una mappa tra volumi e segmentazioni
+            volume_mask_mapping = {
+                #"T1_original": "Segmentation_T1_original",
+                #"T1CE_original": "Segmentation_T1CE_original",
+                #"T2_original": "Segmentation_T2_original",
+                #"FLAIR_original": "Segmentation_FLAIR_original",
+                "T1_original": "Segmentation_original",
+                "T2_original": "Segmentation_original",
+                "T1CE_original": "Segmentation_original",
+                "FLAIR_original": "Segmentation_original",
+                #"T1CE_preprocessed": "Segmentation_Preprocessed",
+                #"T1_preprocessed": "Segmentation_Preprocessed",
+                #"T2_preprocessed": "Segmentation_Preprocessed",
+                #"FLAIR_preprocessed": "Segmentation_Preprocessed"
+            }
+    
+            # Trova il volume attivo
+            activeVolume = None
+            for volumeName in volume_mask_mapping.keys():
+                volumeNode = slicer.util.getNode(volumeName)
+                if volumeNode and volumeNode.GetDisplayNode().GetVisibility():
+                    activeVolume = volumeNode
+                    break
+    
+            if not activeVolume:
+                qt.QMessageBox.warning(None, "Errore", "Nessun volume attivo trovato.")
+                return
+    
+            # Trova la segmentazione corrispondente
+            segmentationName = volume_mask_mapping.get(activeVolume.GetName(), None)
+            if not segmentationName:
+                qt.QMessageBox.warning(None, "Errore", f"Nessuna segmentazione trovata per {activeVolume.GetName()}.")
+                return
+    
+            activeSegmentation = slicer.util.getNode(segmentationName)
+            if not activeSegmentation:
+                qt.QMessageBox.warning(None, "Errore", f"Segmentazione {segmentationName} non trovata.")
+                return
+    
+            # Assicura che solo questa segmentazione sia visibile
+            for segNode in slicer.util.getNodesByClass("vtkMRMLSegmentationNode"):
+                segNode.GetDisplayNode().SetVisibility(segNode == activeSegmentation)
+    
+            # Aggiorna il viewer con il volume e la segmentazione attiva
+            #self.updateSliceViewerLayers({activeVolume.GetName(): activeVolume}, activeSegmentation)
+            self.updateSliceViewerLayers(activeSegmentation)
+            
         except slicer.util.MRMLNodeNotFoundException as e:
-            qt.QMessageBox.warning(None, "Error", str(e))
+            qt.QMessageBox.warning(None, "Errore", str(e))
             return
     
-        self.updateSliceViewerLayers(preprocessed_volumes, segmentationNode)  
         slicer.app.processEvents()
         self.forceSliceRealignment()
+
  
-        
-    def forceSliceRealignment(self):
     
-        volumeNode = slicer.util.getNode("T1CE_Preprocessed")
-        if not volumeNode:
+    
+    def forceSliceRealignment(self):
+        # Lista di tutti i volumi (originali e preprocessati)
+        all_volumes = [
+            "T1_original", "T1CE_original", "T2_original", "FLAIR_original",
+            #"T1CE_Preprocessed", "T1_Preprocessed", "T2_Preprocessed", "FLAIR_Preprocessed"
+        ]
+    
+        activeVolume = None
+    
+        # Trova il volume attivo (quello visibile)
+        for volumeName in all_volumes:
+            volumeNode = slicer.util.getNode(volumeName)
+            if volumeNode and volumeNode.GetDisplayNode().GetVisibility():
+                activeVolume = volumeNode
+                break
+    
+        if not activeVolume:
             return
     
         view_orientation_map = {
@@ -441,13 +510,13 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
             sliceLogic = sliceWidget.sliceLogic()
             sliceNode = sliceLogic.GetSliceNode()
     
-            
             if sliceNode.GetOrientationString() in ["Axial", "Sagittal", "Coronal"]:
                 sliceNode.SetOrientation(orientation)
-                sliceNode.RotateToVolumePlane(volumeNode)
+                sliceNode.RotateToVolumePlane(activeVolume)
                 sliceLogic.FitSliceToAll()
-        
+    
         slicer.app.processEvents()
+
 
 
 
@@ -465,6 +534,13 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
         progressDialog.setMinimumHeight(50)  
         progressDialog.show()
         slicer.app.processEvents()
+        
+        referenceVolume_T1 = slicer.util.getNode("T1_original")
+        referenceVolume_T2 = slicer.util.getNode("T2_original")
+        referenceVolume_T1CE = slicer.util.getNode("T1CE_original")
+        referenceVolume_FLAIR = slicer.util.getNode("FLAIR_original")
+        
+        
     
         sequence_names = ["T1", "T2", "T1CE", "FLAIR"]
     
@@ -516,68 +592,138 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
                     preprocessed_array = batch[key].squeeze()
                     preprocessed_array = np.transpose(preprocessed_array, (2, 0, 1))
     
-                    newVolume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", f"{key}_Preprocessed")
-                    slicer.util.updateVolumeFromArray(newVolume, preprocessed_array)
-                    newVolume.SetOrigin(referenceVolume.GetOrigin())
-                    newVolume.SetSpacing(referenceVolume.GetSpacing())
-                    directionMatrix = vtk.vtkMatrix4x4()
-                    referenceVolume.GetIJKToRASDirectionMatrix(directionMatrix)
-                    newVolume.SetIJKToRASDirectionMatrix(directionMatrix)
-                    preprocessed_volumes[key] = newVolume
+                    #newVolume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", f"{key}_Preprocessed")
+                    #slicer.util.updateVolumeFromArray(newVolume, preprocessed_array)
+                    #newVolume.SetOrigin(referenceVolume.GetOrigin())
+                    #newVolume.SetSpacing(referenceVolume.GetSpacing())
+                    #directionMatrix = vtk.vtkMatrix4x4()
+                    #referenceVolume.GetIJKToRASDirectionMatrix(directionMatrix)
+                    #newVolume.SetIJKToRASDirectionMatrix(directionMatrix)
+                    #preprocessed_volumes[key] = newVolume
     
                     update_progress_bar(5)
-    
-                mask_array = final_prediction.cpu().numpy().squeeze()
-                self.createSegmentationNode(mask_array, preprocessed_volumes)
+                
+                print(final_prediction.shape)
+                
+                dims_T1 = referenceVolume_T1.GetImageData().GetDimensions()
+                #resized_mask_T1 = F.interpolate(final_prediction, size=(dims_T1), mode='nearest')
+                #mask_array_T1 = resized_mask_T1.cpu().numpy().squeeze()
+                resized_mask_T1 = F.interpolate(final_prediction, size=(dims_T1), mode='trilinear', align_corners=False)
+                resized_mask_T1 = (resized_mask_T1 > 0.5).float()
+                mask_array_T1 = resized_mask_T1.cpu().numpy().squeeze()
+                
+               
+        
+                
+                dims_T1CE = referenceVolume_T1CE.GetImageData().GetDimensions()
+                #resized_mask_T1CE = F.interpolate(final_prediction, size=(dims_T1CE), mode='nearest')
+                #mask_array_T1CE = resized_mask_T1CE.cpu().numpy().squeeze()
+                resized_mask_T1CE = F.interpolate(final_prediction, size=(dims_T1CE), mode='trilinear', align_corners=False)
+                resized_mask_T1CE = (resized_mask_T1CE > 0.5).float()
+                mask_array_T1CE = resized_mask_T1CE.cpu().numpy().squeeze()
+                
+                dims_T2 = referenceVolume_T2.GetImageData().GetDimensions()
+                #resized_mask_T2 = F.interpolate(final_prediction, size=(dims_T2), mode='nearest')
+                #mask_array_T2 = resized_mask_T2.cpu().numpy().squeeze()
+                resized_mask_T2 = F.interpolate(final_prediction, size=(dims_T2), mode='trilinear', align_corners=False)
+                resized_mask_T2 = (resized_mask_T1CE > 0.5).float()
+                mask_array_T2 = resized_mask_T2.cpu().numpy().squeeze()
+                
+                dims_FLAIR = referenceVolume_FLAIR.GetImageData().GetDimensions()
+                #resized_mask_FLAIR = F.interpolate(final_prediction, size=(dims_FLAIR), mode='nearest')
+                #mask_array_FLAIR = resized_mask_FLAIR.cpu().numpy().squeeze()
+                resized_mask_FLAIR = F.interpolate(final_prediction, size=(dims_FLAIR), mode='trilinear', align_corners=False)
+                resized_mask_FLAIR = (resized_mask_FLAIR > 0.5).float()
+                mask_array_FLAIR = resized_mask_FLAIR.cpu().numpy().squeeze()
+                
+                mask_redim = final_prediction.cpu().numpy().squeeze()
+                
+                
+                
+                self.createSegmentationNode(mask_array_T1, mask_array_T1CE, mask_array_T2, mask_array_FLAIR,mask_redim) #preprocessed_volumes)
                 update_progress_bar(10)
     
         progressDialog.setValue(100)
         slicer.app.processEvents()
         
-
         
     
+    
+
+
+    
+  
+    
+    
+    def createSegmentationNode(self, mask_array_T1, mask_array_T1CE, mask_array_T2, mask_array_FLAIR, mask_redim):#, preprocessed_volumes):
         
-    def createSegmentationNode(self, mask_array, preprocessed_volumes):
-            referenceVolume = preprocessed_volumes["T1CE"]
         
-            if not isinstance(referenceVolume, slicer.vtkMRMLScalarVolumeNode):
-                qt.QMessageBox.warning(None, "Error", "Il volume di riferimento non è valido.")
-                return
+            
         
-            mask_array = mask_array.astype(np.uint8)
-            print("Shape maschera:", mask_array.shape)
-            print("Valori unici nella maschera:", np.unique(mask_array))
-            segmentationNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", "Segmentation")
+            
+       
+        volume_mask_mapping = {
+            #"T1CE_Preprocessed": mask_redim,
+            #"T1CE_original": mask_array_T1CE,
+            #"Preprocessed": mask_redim,
+            "original": mask_array_T1,
+            #"T2_original": mask_array_T2,
+            #"FLAIR_original": mask_array_FLAIR,
+            #"T1_original": mask_array_T1
+             
+        }
+    
+        segment_labels = ["NET", "ED", "ET"]
+        colors = [(1, 0, 0), (0, 1, 0), (0, 0, 1)]  # Rosso, Verde, Blu
+        active_segmentation_node = None
+        
+        for volume_name, mask_array in volume_mask_mapping.items():
+            #referenceVolume = slicer.util.getNode(volume_name)  
+            referenceVolume = slicer.util.getNode(f"T1_{volume_name}")
+            
+           
+            segmentationNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", f"Segmentation_{volume_name}")
             segmentationNode.SetReferenceImageGeometryParameterFromVolumeNode(referenceVolume)
             segmentationNode.CreateDefaultDisplayNodes()
             slicer.app.processEvents()
-        
-            labels = ["NET", "ED", "ET"]
-            colors = [(1, 0, 0), (0, 1, 0), (0, 0, 1)]
-        
-            for i, label in enumerate(labels):
+    
+            
+            mask_array = mask_array.astype(np.uint8)
+            print(f" Maschera per {volume_name}")
+            print("Shape maschera:", mask_array.shape)
+            print("Valori unici nella maschera:", np.unique(mask_array))
+    
+            for i, label in enumerate(segment_labels):
                 segmentId = segmentationNode.GetSegmentation().AddEmptySegment(label)
-                mask = mask_array[i].transpose(2,0,1)  
-                print("Shape maschera:", mask.shape)
+                mask = mask_array[i].transpose(2, 0, 1)  
+                
+                print(f"Segmento {label} - Shape: {mask.shape}")
                 slicer.util.updateSegmentBinaryLabelmapFromArray(mask, segmentationNode, segmentId, referenceVolume)
                 segmentationNode.GetSegmentation().GetSegment(segmentId).SetColor(colors[i])
-        
-
-            slicer.app.processEvents()
-        
+    
+            
             segmentationDisplayNode = segmentationNode.GetDisplayNode()
             segmentationDisplayNode.SetVisibility2DFill(True)
             segmentationDisplayNode.SetVisibility2DOutline(True)
             segmentationDisplayNode.SetVisibility3D(True)
             
-            self.updateSliceViewerLayers(preprocessed_volumes, segmentationNode)
-                
-   
+            if active_segmentation_node:
+                active_segmentation_node.GetDisplayNode().SetVisibility(False)
+            
+            active_segmentation_node = segmentationNode  
+            
+            
+            
+            #self.updateSliceViewerLayers(preprocessed_volumes, segmentationNode)
+            self.updateSliceViewerLayers(segmentationNode)
     
-   
+        slicer.app.processEvents()
 
-    def updateSliceViewerLayers(self, preprocessed_volumes=None, segmentationNode=None):
+
+    
+    
+    #def updateSliceViewerLayers(self, preprocessed_volumes=None, segmentationNode=None):
+    def updateSliceViewerLayers(self, segmentationNode=None):
         #if preprocessed_volumes is None:
             #try:
                 #preprocessed_volumes = {key: slicer.util.getNode(f'Preprocessed_{key}') for key in ["T1CE", "T1", "T2", "FLAIR"]}
@@ -586,13 +732,14 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
                 #return
         if segmentationNode is None:
             try:
-                segmentationNode = slicer.util.getNode('Segmentation')
+                segmentationNode = slicer.util.getNode('Mask_Segmentation')
             except slicer.util.MRMLNodeNotFoundException as e:
                 qt.QMessageBox.warning(None, "Error", str(e))
                 return
     
         
-        volumeNode = preprocessed_volumes["T1CE"]
+        
+        volumeNode = slicer.util.getNode("T1_original")
     
         
         view_orientation_map = {
@@ -617,7 +764,7 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
             sliceNode.RotateToVolumePlane(volumeNode)
             sliceLogic.FitSliceToAll()
     
-
+    
             def createOrientationCallback(sliceNode, sliceLogic, volumeNode, defaultOrientation):
                 def onOrientationChanged(caller, event):
                     currentOrientation = sliceNode.GetOrientationString()
@@ -626,16 +773,15 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
                         sliceLogic.FitSliceToAll()
                 return onOrientationChanged
     
-
+    
             observerTag = getattr(sliceNode, "_orientationObserver", None)
             if observerTag is not None:
                 sliceNode.RemoveObserver(observerTag)
-
+    
             observerTag = sliceNode.AddObserver(vtk.vtkCommand.ModifiedEvent, createOrientationCallback(sliceNode, sliceLogic, volumeNode, defaultOrientation))
             setattr(sliceNode, "_orientationObserver", observerTag)
     
         slicer.app.processEvents() 
-
 
    
         
