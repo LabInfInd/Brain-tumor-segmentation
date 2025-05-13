@@ -5,11 +5,12 @@ Created on Wed Feb 26 10:27:14 2025
 @author: Utente
 """
 
+
 import os
 import torch
 import numpy as np
-from monai.transforms import  EnsureChannelFirstd, Compose, LoadImaged, EnsureTyped, Orientationd, Resized, NormalizeIntensityd, AdjustContrastd, Activations, AsDiscrete
-from monai.data import DataLoader, Dataset, decollate_batch
+from monai.transforms import  EnsureChannelFirstd, Compose, LoadImaged, Spacingd, EnsureTyped, Orientationd, Resized,Resize, NormalizeIntensityd, AdjustContrastd,CropForegroundd, Activations,GaussianSharpend, AsDiscrete
+from monai.data import DataLoader, Dataset, decollate_batch, CacheDataset
 from monai.data.meta_tensor import MetaTensor
 from slicer.ScriptedLoadableModule import *
 import slicer
@@ -100,13 +101,7 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
         self.confirmSelectionButton.connect('clicked(bool)', self.onConfirmSelection)
         
         
-        titleLabel = qt.QLabel("Skullstripping") 
-        titleLabel.setStyleSheet("font-weight: bold; font-size: 14px; margin-top: 10px; margin-bottom: 5px;")  
-        self.layout.addWidget(titleLabel)
-        self.skullstrippingButton = qt.QPushButton("Run Skullstripping")
-        self.layout.addWidget(self.skullstrippingButton)
-        self.skullstrippingButton.setEnabled(False) 
-        self.skullstrippingButton.connect('clicked(bool)', self.onSkullStrippingButton)
+        
         
         
         titleLabel = qt.QLabel("Preprocessing")  
@@ -118,7 +113,13 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
         self.preprocessingButton.connect('clicked(bool)', self.onPreprocessingButton)
         
         
-        
+        titleLabel = qt.QLabel("Skullstripping") 
+        titleLabel.setStyleSheet("font-weight: bold; font-size: 14px; margin-top: 10px; margin-bottom: 5px;")  
+        self.layout.addWidget(titleLabel)
+        self.skullstrippingButton = qt.QPushButton("Run Skullstripping")
+        self.layout.addWidget(self.skullstrippingButton)
+        self.skullstrippingButton.setEnabled(False) 
+        self.skullstrippingButton.connect('clicked(bool)', self.onSkullStrippingButton)
         
         
         
@@ -232,17 +233,57 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
     
         
         qt.QMessageBox.information(self.parent, "Volumes Selected", "Volumes successfully selected and renamed!")
-        self.skullstrippingButton.setEnabled(True)
-        #self.preprocessingButton.setEnabled(True)
+        #self.skullstrippingButton.setEnabled(True)
+        self.preprocessingButton.setEnabled(True)
         #self.inferenceButton.setEnabled(True)
         #self.modifySegmentationButton.setEnabled(True)
                 
     def onPreprocessingButton(self):
-        modalities = ["T1", "T2", "T1CE", "FLAIR"]
-        fixedImage = slicer.util.getNode("T1")  
-    
+        modalities = ["T1CE","FLAIR","T1", "T2"]
+          
+        """
         for modality in modalities:
             movingImage = slicer.util.getNode(modality)
+            
+            
+
+            roiNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsROINode", f"{movingImage.GetName()}_ROI")
+
+            # Usa la funzione interna del logic per adattare la ROI al volume
+            cropVolumeLogic = slicer.modules.cropvolume.logic()
+           
+        
+            isotropicSpacing = True
+        
+            # Imposta parametri
+            cropParameters = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLCropVolumeParametersNode")
+            cropParameters.SetInputVolumeNodeID(movingImage.GetID())
+            cropParameters.SetOutputVolumeNodeID(movingImage.GetID())
+            cropParameters.SetROINodeID(roiNode.GetID())
+            cropParameters.SetIsotropicResampling(isotropicSpacing)
+            cropParameters.SetSpacingScalingConst(1.0)
+        
+            # Esegui il crop
+            # Applica il fit ROI al volume
+            
+            cropVolumeLogic.FitROIToInputVolume(cropParameters)
+        
+            # Applica il crop interpolato
+            #cropVolumeLogic.CropInterpolated(cropParameters)
+        
+            # Pulizia
+            slicer.mrmlScene.RemoveNode(cropParameters)
+            slicer.mrmlScene.RemoveNode(roiNode)
+        """   
+        
+          
+        fixedImage = slicer.util.getNode("T1CE")
+        
+       
+        #fixedImage = slicer.util.loadVolume("C:\\Users\\Utente\\Downloads\\MNI152_T1_1mm.nii")
+        for modality in modalities:
+            movingImage = slicer.util.getNode(modality)
+            print(movingImage.GetID())
             if movingImage is None:
                 print(f"Il volume {modality} non è stato trovato, salto...")
                 continue
@@ -253,44 +294,145 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
                 print(f"Errore: Il volume {modality} non ha un nodo di archiviazione, impossibile sovrascrivere.")
                 continue
             originalPath = storageNode.GetFullNameFromFileName()
-    
+            
+            
+            
+        
+           
 
             transformNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", f"{modality}_transform")
-
-    
-
+            outputVolumeNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", f"{modality}_original")
+            
+            
             parameters = {
                 "fixedVolume": fixedImage.GetID(),
-                "movingVolume": movingImage.GetID(),
+                "movingVolume": movingImage.GetID(),               
                 "linearTransform": transformNode.GetID(),
-                "interpolationMode": "Linear",
+                #"bsplineTransform": '',
+                #"samplingPercentage": 0.02,
+                #"inizializationTransform": '',
+                'interpolationMode':  'Linear',
                 "initializeTransformMode": "useMomentsAlign",
-
-                "use_histogram_matching": True,
-                "outputVolume": movingImage.GetID(),
-
-                "useRigid": True
+               
+                
+                "outputVolume": outputVolumeNode.GetID(),
+                "transformType": "Rigid",
+                #"initializeRegistrationByCurrentGenericTransform": False,
+                "numberOfSamples": 0,
+                
+                "useRigid": True,
+            
+            
+            
+                "useComposite": False,
+                'useBSpline':         False,         # flag per B-Spline
+                'useAffine':          False,         # Affine (12 DOF)
+                'useRigidScale':      False,         # Rigid+Scale (7 DOF)
+                'useRigidScaleSkew':  False,         # Rigid+Scale+Skew (10 DOF)
+                'useSyN':             False,
+                "useScaleVersor3D": False,
+                "useScaleSkewVersor3D": False,
+                'splineGridSize':    [14,10,12],
+                "maskProcessingMode": "NOMASK",
+                "cropOutput": False,
+                'histogramMatch':  False,
+                'useROIBSpline': False,
+                "costMetric": "MMI",
+                
+                'medianFilterSize':    '0,0,0',      # Median Filter Size
+                'removeIntensityOutliers': 0.0,   # Remove Intensity Outliers Value
+            
+                # *** advanced output ***
+                'outputVolumePixelType':    'float',       # float, short, ushort, int, uint, uchar
+                'backgroundFillValue':0.0,           # Background Fill Value
+                'scaleOutputValues':        False,         # Scale Output Values
+                
+                # *** advanced optimization ***
+                'numberOfIterations': 1500,
+                'maximumStepLength':         0.05,
+                'minimumStepLength':         0.001,
+                'relaxationFactor':          0.5,
+                'translationScale':           1000.0,
+                'reproportionScale':         1.0,
+                'skewScale':                1.0,
+                'maxBSplineDisplacement':0.0,
+                'fixedVolumeTimeIndex': 0,
+                'movingVolumeTimeIndex':0,
+                
+            
+                # *** expert-only ***
+                'fixedImageTimeIndex':      0,
+                'movingImageTimeIndex':     0,
+                'numberOfHistogramBins':        50,
+                'numberOfMatchPoints':      10,
+                'costMetric':               'MMI',     # MMI, MSE, NC, MIH
+                'maskInferiorCutOffFromCenter': 1000.0,
+                'ROIAutoDilateSize':        0.0,
+                'ROIAutoClosingSize':       9.0,
+                'numberOfSamples':          0,
+                'strippedOutputTransform':     '',
+                'passOutputTransformToBSpline': False,
+                'writeOutputTransformsInSinglePrecision': False,
+            
+                # *** debugging ***
+                'failureExitCode':          -1,
+                'writeTransformOnFailure':  False,
+                'numberOfThreads':          -1,
+                'debugLevel':               0,
+                'samplingStrategy':         'Random',  # Random o Regular
+                'maximumNumberOfCorrections': 25,
+                'maximumNumberOfEvaluations': 900,
+                'costFunctionConvergenceFactor': 20000000000000.00,
+                'projectedGradientTolerance': 0.00,
             }
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                  
+            
+            
+            
+            
+           
     
 
             cliModule = slicer.modules.brainsfit
+            #cliModule = slicer.modules.antsregistrationcli
             cliNode = slicer.cli.runSync(cliModule, None, parameters)
+            
+           
+            
             
     
         print("Volumi registrati e sovrascritti")
-        self.inferenceButton.setEnabled(True)
+        self.skullstrippingButton.setEnabled(True)
+        
         
     
     def onSkullStrippingButton(self):
         
-        modalities = ["T1", "T2", "T1CE", "FLAIR"]
+        modalities = ["T1_original", "T2_original", "T1CE_original", "FLAIR_original"]
+        new_modalities = ["T1", "T2", "T1CE", "FLAIR"]
         
-        for modality in modalities:
+        #for modality in modalities:
+        for modality, modality_new in zip(modalities, new_modalities):
             imageNode = slicer.util.getNode(modality)
+            patientOutputVolume = slicer.util.getNode(modality_new)
+
+   
+            
             if imageNode is None:
                 print(f"Il volume {modality} non è stato trovato, salto...")
                 continue
-    
+            
+            """
             originalNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", f"{modality}_original")
 
             
@@ -311,13 +453,15 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
             
            
             originalNode.SetName(f"{modality}_original") 
+            """
 
             maskVolumeNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", f"{modality}_brainmask")
     
 
             parameters = {
                 "patientVolume": imageNode.GetID(),
-                "patientOutputVolume": imageNode.GetID(),
+                #"patientOutputVolume": imageNode.GetID(),
+                "patientOutputVolume": patientOutputVolume.GetID(),
                 "patientMaskLabel": maskVolumeNode.GetID() 
                 }
 
@@ -326,7 +470,8 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
     
         self.checkForNewVolumes()
         print("Skull Stripping eseguito")
-        self.preprocessingButton.setEnabled(True)
+        self.inferenceButton.setEnabled(True)
+        #self.preprocessingButton.setEnabled(True)
         
     
 
@@ -390,14 +535,14 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.updatingSlice = False
 
-
+        #self.crop = CropForegroundd(keys=["T2", "FLAIR", "T1", "T1CE"], source_key="T1CE", return_transform=True, allow_missing_keys=True)
         self.transforms = Compose([
     
             EnsureTyped(keys=["T1", "T2", "FLAIR", "T1CE"]),
             Orientationd(keys=["T1", "T2", "FLAIR", "T1CE"], axcodes="RAS"),
             Resized(keys=["T1", "T2", "FLAIR", "T1CE"], spatial_size=(192, 192,150), mode="trilinear", align_corners=True), #!!!!
             NormalizeIntensityd(keys=["T1", "T2", "FLAIR", "T1CE"], nonzero=True, channel_wise=True),
-            AdjustContrastd(keys=["T2", "FLAIR"], gamma=1.1)
+
         ])
         self.post_trans = Compose([Activations(sigmoid=True), AsDiscrete(threshold=0.5)])
 
@@ -482,10 +627,13 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
     
     def forceSliceRealignment(self):
         # Lista di tutti i volumi (originali e preprocessati)
+        
         all_volumes = [
             "T1_original", "T1CE_original", "T2_original", "FLAIR_original",
             #"T1CE_Preprocessed", "T1_Preprocessed", "T2_Preprocessed", "FLAIR_Preprocessed"
         ]
+        
+        
     
         activeVolume = None
     
@@ -535,10 +683,13 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
         progressDialog.show()
         slicer.app.processEvents()
         
+        
         referenceVolume_T1 = slicer.util.getNode("T1_original")
         referenceVolume_T2 = slicer.util.getNode("T2_original")
         referenceVolume_T1CE = slicer.util.getNode("T1CE_original")
         referenceVolume_FLAIR = slicer.util.getNode("FLAIR_original")
+        
+        
         
         
     
@@ -584,6 +735,11 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
     
                 all_predictions = torch.stack(all_predictions)
                 final_prediction = torch.mode(all_predictions, dim=0)[0]
+                
+                
+               
+                
+                
                 update_progress_bar(10)
     
                 preprocessed_volumes = {}
@@ -591,24 +747,26 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
                     referenceVolume = slicer.util.getNode(key)
                     preprocessed_array = batch[key].squeeze()
                     preprocessed_array = np.transpose(preprocessed_array, (2, 0, 1))
-    
-                    #newVolume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", f"{key}_Preprocessed")
-                    #slicer.util.updateVolumeFromArray(newVolume, preprocessed_array)
-                    #newVolume.SetOrigin(referenceVolume.GetOrigin())
-                    #newVolume.SetSpacing(referenceVolume.GetSpacing())
-                    #directionMatrix = vtk.vtkMatrix4x4()
-                    #referenceVolume.GetIJKToRASDirectionMatrix(directionMatrix)
-                    #newVolume.SetIJKToRASDirectionMatrix(directionMatrix)
-                    #preprocessed_volumes[key] = newVolume
+                    
+                    """
+                    newVolume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", f"{key}_Preprocessed")
+                    slicer.util.updateVolumeFromArray(newVolume, preprocessed_array)
+                    newVolume.SetOrigin(referenceVolume.GetOrigin())
+                    newVolume.SetSpacing(referenceVolume.GetSpacing())
+                    directionMatrix = vtk.vtkMatrix4x4()
+                    referenceVolume.GetIJKToRASDirectionMatrix(directionMatrix)
+                    newVolume.SetIJKToRASDirectionMatrix(directionMatrix)
+                    preprocessed_volumes[key] = newVolume
+                    """
     
                     update_progress_bar(5)
                 
-                print(final_prediction.shape)
+                print("shape final_pred:",final_prediction.shape)
                 
                 dims_T1 = referenceVolume_T1.GetImageData().GetDimensions()
                 #resized_mask_T1 = F.interpolate(final_prediction, size=(dims_T1), mode='nearest')
                 #mask_array_T1 = resized_mask_T1.cpu().numpy().squeeze()
-                resized_mask_T1 = F.interpolate(final_prediction, size=(dims_T1), mode='trilinear', align_corners=False)
+                resized_mask_T1 = F.interpolate(final_prediction, size=(dims_T1), mode='trilinear', align_corners=True)
                 resized_mask_T1 = (resized_mask_T1 > 0.5).float()
                 mask_array_T1 = resized_mask_T1.cpu().numpy().squeeze()
                 
@@ -616,23 +774,45 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
         
                 
                 dims_T1CE = referenceVolume_T1CE.GetImageData().GetDimensions()
+                print(dims_T1CE)
+                
+                
+                
+                
+                
                 #resized_mask_T1CE = F.interpolate(final_prediction, size=(dims_T1CE), mode='nearest')
                 #mask_array_T1CE = resized_mask_T1CE.cpu().numpy().squeeze()
-                resized_mask_T1CE = F.interpolate(final_prediction, size=(dims_T1CE), mode='trilinear', align_corners=False)
+                resized_mask_T1CE = F.interpolate(final_prediction, size=(dims_T1CE), mode='trilinear', align_corners=True)
                 resized_mask_T1CE = (resized_mask_T1CE > 0.5).float()
+                #resize = Resize(spatial_size=(dims_T1CE), mode="trilinear", align_corners=True)
+                #resized_mask_T1CE = resize(final_prediction[0])
                 mask_array_T1CE = resized_mask_T1CE.cpu().numpy().squeeze()
+                
+                
+                """
+                out_channels = []
+                for c in range(final_prediction.shape[1]):
+                    ch = final_prediction[:, c:c+1]  # [1, 1, D, H, W]
+                    resized = F.interpolate(ch, size=dims_T1CE, mode='trilinear', align_corners=True)  # preserves 0/1
+                    resized = (resized > 0.5).float()  # enforce binary
+                    out_channels.append(resized[0, 0])  # [D, H, W]
+            
+                
+                resized_mask_T1CE = torch.stack(out_channels)
+                mask_array_T1CE = resized_mask_T1CE.cpu().numpy()
+                """
                 
                 dims_T2 = referenceVolume_T2.GetImageData().GetDimensions()
                 #resized_mask_T2 = F.interpolate(final_prediction, size=(dims_T2), mode='nearest')
                 #mask_array_T2 = resized_mask_T2.cpu().numpy().squeeze()
-                resized_mask_T2 = F.interpolate(final_prediction, size=(dims_T2), mode='trilinear', align_corners=False)
+                resized_mask_T2 = F.interpolate(final_prediction, size=(dims_T2), mode='trilinear', align_corners=True)
                 resized_mask_T2 = (resized_mask_T1CE > 0.5).float()
                 mask_array_T2 = resized_mask_T2.cpu().numpy().squeeze()
                 
                 dims_FLAIR = referenceVolume_FLAIR.GetImageData().GetDimensions()
                 #resized_mask_FLAIR = F.interpolate(final_prediction, size=(dims_FLAIR), mode='nearest')
                 #mask_array_FLAIR = resized_mask_FLAIR.cpu().numpy().squeeze()
-                resized_mask_FLAIR = F.interpolate(final_prediction, size=(dims_FLAIR), mode='trilinear', align_corners=False)
+                resized_mask_FLAIR = F.interpolate(final_prediction, size=(dims_FLAIR), mode='trilinear', align_corners=True)
                 resized_mask_FLAIR = (resized_mask_FLAIR > 0.5).float()
                 mask_array_FLAIR = resized_mask_FLAIR.cpu().numpy().squeeze()
                 
@@ -640,7 +820,7 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
                 
                 
                 
-                self.createSegmentationNode(mask_array_T1, mask_array_T1CE, mask_array_T2, mask_array_FLAIR,mask_redim) #preprocessed_volumes)
+                self.createSegmentationNode(mask_array_T1, mask_array_T1CE, mask_array_T2, mask_array_FLAIR,mask_redim) #, preprocessed_volumes)
                 update_progress_bar(10)
     
         progressDialog.setValue(100)
@@ -657,7 +837,10 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
     
     def createSegmentationNode(self, mask_array_T1, mask_array_T1CE, mask_array_T2, mask_array_FLAIR, mask_redim):#, preprocessed_volumes):
         
-        
+        #nodes_to_remove = ["T1", "T2", "T1CE", "FLAIR"]
+        #for node_name in nodes_to_remove:
+            #node = slicer.util.getNode(node_name)
+            #slicer.mrmlScene.RemoveNode(node)
             
         
             
@@ -666,7 +849,8 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
             #"T1CE_Preprocessed": mask_redim,
             #"T1CE_original": mask_array_T1CE,
             #"Preprocessed": mask_redim,
-            "original": mask_array_T1,
+            "original": mask_array_T1CE,
+            #"original": mask_redim,
             #"T2_original": mask_array_T2,
             #"FLAIR_original": mask_array_FLAIR,
             #"T1_original": mask_array_T1
@@ -679,7 +863,7 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
         
         for volume_name, mask_array in volume_mask_mapping.items():
             #referenceVolume = slicer.util.getNode(volume_name)  
-            referenceVolume = slicer.util.getNode(f"T1_{volume_name}")
+            referenceVolume = slicer.util.getNode(f"T1CE_{volume_name}")
             
            
             segmentationNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", f"Segmentation_{volume_name}")
@@ -701,7 +885,7 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
                 slicer.util.updateSegmentBinaryLabelmapFromArray(mask, segmentationNode, segmentId, referenceVolume)
                 segmentationNode.GetSegmentation().GetSegment(segmentId).SetColor(colors[i])
     
-            
+            # Impostazioni di visualizzazione
             segmentationDisplayNode = segmentationNode.GetDisplayNode()
             segmentationDisplayNode.SetVisibility2DFill(True)
             segmentationDisplayNode.SetVisibility2DOutline(True)
@@ -739,7 +923,7 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
     
         
         
-        volumeNode = slicer.util.getNode("T1_original")
+        volumeNode = slicer.util.getNode("T1CE_original")
     
         
         view_orientation_map = {
