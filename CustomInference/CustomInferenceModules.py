@@ -1,10 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Wed Feb 26 10:27:14 2025
-
-@author: Utente
-"""
-
 
 import os
 import torch
@@ -18,7 +11,11 @@ import vtk, qt, ctk
 import time
 import torch.nn.functional as F
 
-import SimpleITK as sitk
+import platform
+import re, glob
+from DICOMLib import DICOMUtils
+
+
 from VNetModel.VNetModel import VNetMultiEncoder
 
 class CustomInferenceModules(ScriptedLoadableModule):
@@ -51,6 +48,13 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
         self.loadModelButton = qt.QPushButton("Select Model")
         self.layout.addWidget(self.loadModelButton)
         self.loadModelButton.connect('clicked(bool)', self.onLoadModelButton)
+        
+        
+       
+        self.loadDicomFolderButton = qt.QPushButton("Load DICOM folder → convert to NIfTI")
+        self.layout.addWidget(self.loadDicomFolderButton)
+        self.loadDicomFolderButton.connect('clicked(bool)', self.onLoadDicomFolder)
+       
         
       
         
@@ -148,9 +152,29 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
         
         self.layout.addStretch(1)
         
+    def onLoadDicomFolder(self):
+        dicomDir = qt.QFileDialog.getExistingDirectory(self.parent, "Select DICOM folder")
+        if not dicomDir:
+            return
+        try:
+            outDir, volumeNodes = self.logic.loadDicomFolderAndExportAllToNifti(dicomDir)
+    
+            # aggiorna combobox (ora vedranno .nii.gz nei path)
+            self.updateComboBoxes()
+    
+            qt.QMessageBox.information(
+                self.parent, "Done",
+                f"Caricati {len(volumeNodes)} volumi e salvati in NIfTI.\n\nOutput:\n{outDir}"
+            )
+        except Exception as e:
+            qt.QMessageBox.warning(self.parent, "DICOM→NIfTI Error", str(e))
+        
     def updateComboBoxes(self):      
         for comboBox in self.volumeSelectors.values():
             self.populateVolumeSelector(comboBox)
+            
+   
+    
     
     def checkForNewVolumes(self):
         
@@ -191,17 +215,16 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
     
     
     def populateVolumeSelector(self, comboBox):
-        
-        comboBox.clear() 
+        comboBox.clear()
         volumeNodes = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
-        
-        
+    
         for node in volumeNodes:
             storageNode = node.GetStorageNode()
             if storageNode and storageNode.GetFileName():
                 filePath = storageNode.GetFileName()
-                comboBox.addItem(filePath, node) 
-            
+                shortName = os.path.basename(filePath)          
+                comboBox.addItem(shortName, node)              
+    
         slicer.app.processEvents()
 
     def onConfirmSelection(self):
@@ -213,6 +236,13 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
                 selectedNode = comboBox.itemData(selectedIndex)  
                 
                 if selectedNode:
+                    
+                    
+                    #if self.logic.needsNiftiExport(selectedNode):
+                        #niftiPath = self.logic.ensureNiftiOnDisk(selectedNode, modality)
+                        #print(f"[→NIfTI] {modality}: {niftiPath}")
+                    #else:
+                        #print(f"[OK] {modality} già NIfTI")
                     existingNode = slicer.util.getNode(modality) if slicer.util.getNodes(modality) else None
     
 
@@ -237,44 +267,12 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
         self.preprocessingButton.setEnabled(True)
         #self.inferenceButton.setEnabled(True)
         #self.modifySegmentationButton.setEnabled(True)
+        self.updateComboBoxes()
                 
     def onPreprocessingButton(self):
         modalities = ["T1CE","FLAIR","T1", "T2"]
           
-        """
-        for modality in modalities:
-            movingImage = slicer.util.getNode(modality)
-            
-            
-
-            roiNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsROINode", f"{movingImage.GetName()}_ROI")
-
-            # Usa la funzione interna del logic per adattare la ROI al volume
-            cropVolumeLogic = slicer.modules.cropvolume.logic()
-           
         
-            isotropicSpacing = True
-        
-            # Imposta parametri
-            cropParameters = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLCropVolumeParametersNode")
-            cropParameters.SetInputVolumeNodeID(movingImage.GetID())
-            cropParameters.SetOutputVolumeNodeID(movingImage.GetID())
-            cropParameters.SetROINodeID(roiNode.GetID())
-            cropParameters.SetIsotropicResampling(isotropicSpacing)
-            cropParameters.SetSpacingScalingConst(1.0)
-        
-            # Esegui il crop
-            # Applica il fit ROI al volume
-            
-            cropVolumeLogic.FitROIToInputVolume(cropParameters)
-        
-            # Applica il crop interpolato
-            #cropVolumeLogic.CropInterpolated(cropParameters)
-        
-            # Pulizia
-            slicer.mrmlScene.RemoveNode(cropParameters)
-            slicer.mrmlScene.RemoveNode(roiNode)
-        """   
         
           
         fixedImage = slicer.util.getNode("T1CE")
@@ -293,7 +291,7 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
             if not storageNode:
                 print(f"Errore: Il volume {modality} non ha un nodo di archiviazione, impossibile sovrascrivere.")
                 continue
-            originalPath = storageNode.GetFullNameFromFileName()
+            #originalPath = storageNode.GetFullNameFromFileName()
             
             
             
@@ -398,22 +396,22 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
                   
             
             
-            
-            
-           
-    
 
             cliModule = slicer.modules.brainsfit
             #cliModule = slicer.modules.antsregistrationcli
             cliNode = slicer.cli.runSync(cliModule, None, parameters)
             
+            
+            
+           
            
             
             
     
         print("Volumi registrati e sovrascritti")
         self.skullstrippingButton.setEnabled(True)
-        
+        #self.inferenceButton.setEnabled(True)
+       
         
     
     def onSkullStrippingButton(self):
@@ -432,28 +430,7 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
                 print(f"Il volume {modality} non è stato trovato, salto...")
                 continue
             
-            """
-            originalNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", f"{modality}_original")
-
             
-            originalNode.Copy(imageNode)  
-         
-            newStorageNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLVolumeArchetypeStorageNode")
-            
-         
-            storageNode = imageNode.GetStorageNode()
-            
-            if storageNode:
-                
-                originalNode.SetAndObserveStorageNodeID(newStorageNode.GetID())  
-            
-               
-                filePath = storageNode.GetFileName()
-                newStorageNode.SetFileName(filePath)  
-            
-           
-            originalNode.SetName(f"{modality}_original") 
-            """
 
             maskVolumeNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", f"{modality}_brainmask")
     
@@ -464,9 +441,13 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
                 "patientOutputVolume": patientOutputVolume.GetID(),
                 "patientMaskLabel": maskVolumeNode.GetID() 
                 }
+            
+           
 
             cliModule = slicer.modules.swissskullstripper
             cliNode = slicer.cli.runSync(cliModule, None, parameters)
+            
+            
     
         self.checkForNewVolumes()
         print("Skull Stripping eseguito")
@@ -534,18 +515,138 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
         self.models = []
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.updatingSlice = False
+        self.niftiExportDir = os.path.join(slicer.app.temporaryPath,"nifti_from_dicom")
 
         #self.crop = CropForegroundd(keys=["T2", "FLAIR", "T1", "T1CE"], source_key="T1CE", return_transform=True, allow_missing_keys=True)
         self.transforms = Compose([
     
             EnsureTyped(keys=["T1", "T2", "FLAIR", "T1CE"]),
             Orientationd(keys=["T1", "T2", "FLAIR", "T1CE"], axcodes="RAS"),
+            #CropForegroundd(keys=["T2", "FLAIR", "T1", "T1CE"], source_key="T1CE", return_transform=True),
+            #self.crop,
+            #Spacingd(keys=["image"], pixdim=(1.0, 1.0, 1.0), mode="bilinear"),
             Resized(keys=["T1", "T2", "FLAIR", "T1CE"], spatial_size=(192, 192,150), mode="trilinear", align_corners=True), #!!!!
             NormalizeIntensityd(keys=["T1", "T2", "FLAIR", "T1CE"], nonzero=True, channel_wise=True),
-
+            #GaussianSharpend(keys=["T1", "T2", "FLAIR", "T1CE"], sigma1=1.0, sigma2=2.0, alpha=0.5),
+            #AdjustContrastd(keys=["T2", "FLAIR", "T1CE", "T1"], gamma=0.7)
         ])
         self.post_trans = Compose([Activations(sigmoid=True), AsDiscrete(threshold=0.5)])
+        
+    def isDicomVolume(self, volumeNode):
+        # Se il nodo proviene dal DICOM module, di solito ha questa attribute
+        uids = volumeNode.GetAttribute("DICOM.instanceUIDs")
+        return (uids is not None) and (len(uids) > 0)
 
+
+    def _safeName(self, s: str) -> str:
+        s = (s or "").strip()
+        s = re.sub(r"[^a-zA-Z0-9_\-]+", "_", s)
+        return s[:80] if s else "volume"
+    
+    def _uniquePath(self, outDir: str, base: str) -> str:
+        p = os.path.join(outDir, f"{base}.nii.gz")
+        if not os.path.exists(p):
+            return p
+        i = 2
+        while True:
+            p2 = os.path.join(outDir, f"{base}_{i}.nii.gz")
+            if not os.path.exists(p2):
+                return p2
+            i += 1
+    
+    def loadDicomFolderAndExportAllToNifti(self, dicomDir, outDir=None):
+        """
+        1) Importa tutti i DICOM (cartella + sotto-cartelle) in DB temporaneo
+        2) Carica tutte le serie in scena (volumi con i nomi assegnati da Slicer)
+        3) Esporta OGNI volume scalare in .nii.gz e aggiorna lo storage node del volume
+           (quindi NON crea volumi aggiuntivi)
+        Ritorna: (outDir, listaVolumeNodes)
+        """
+        if outDir is None:
+            folderName = self._safeName(os.path.basename(os.path.normpath(dicomDir)))
+            outDir = os.path.join(slicer.app.temporaryPath, "nifti_from_dicom", folderName)
+        os.makedirs(outDir, exist_ok=True)
+    
+        loadedNodeIDs = []
+    
+        # NB: la corretta indentazione è fondamentale: import+load devono stare dentro il context
+        with DICOMUtils.TemporaryDICOMDatabase() as db:
+            DICOMUtils.importDicom(dicomDir, db)
+            patientUIDs = db.patients()
+            if not patientUIDs:
+                raise RuntimeError(f"Nessun DICOM importato da: {dicomDir}")
+    
+            for patientUID in patientUIDs:
+                loadedNodeIDs.extend(DICOMUtils.loadPatientByUID(patientUID))
+    
+        # prendi solo i vtkMRMLScalarVolumeNode caricati
+        volumeNodes = []
+        for nid in loadedNodeIDs:
+            n = slicer.mrmlScene.GetNodeByID(nid)
+            if n and n.IsA("vtkMRMLScalarVolumeNode"):
+                volumeNodes.append(n)
+    
+        if not volumeNodes:
+            raise RuntimeError("Nessun vtkMRMLScalarVolumeNode caricato (solo segmentazioni/altro?)")
+    
+        # esporta in NIfTI aggiornando lo storage (nessun nodo nuovo)
+        for v in volumeNodes:
+            base = self._safeName(v.GetName())
+            niftiPath = self._uniquePath(outDir, base)
+    
+            ok = slicer.util.saveNode(v, niftiPath)
+            if not ok:
+                raise RuntimeError(f"Impossibile salvare {v.GetName()} in {niftiPath}")
+    
+            storage = v.GetStorageNode()
+            if storage is None:
+                storage = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLVolumeArchetypeStorageNode")
+                v.SetAndObserveStorageNodeID(storage.GetID())
+            storage.SetFileName(niftiPath)
+    
+            print(f"[DICOM→NIfTI] {v.GetName()} -> {niftiPath}")
+    
+        return outDir, volumeNodes
+    
+    
+    
+
+    def ensureNiftiOnDisk(self, volumeNode, outBaseName, outDir=None):
+        """
+        Se volumeNode è DICOM, salva su disco in NIfTI e aggiorna lo storage node
+        per puntare al .nii.gz. Ritorna il path creato.
+        """
+        if outDir is None:
+            outDir = self.niftiExportDir
+
+        os.makedirs(outDir, exist_ok=True)
+        niftiPath = os.path.join(outDir, f"{outBaseName}.nii.gz")
+
+        ok = slicer.util.saveNode(volumeNode, niftiPath)
+        if not ok:
+            raise RuntimeError(f"Impossibile salvare il volume {volumeNode.GetName()} in NIfTI: {niftiPath}")
+
+        # Assicura che il nodo abbia uno storage node e che punti al NIfTI appena creato
+        storageNode = volumeNode.GetStorageNode()
+        if storageNode is None:
+            storageNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLVolumeArchetypeStorageNode")
+            volumeNode.SetAndObserveStorageNodeID(storageNode.GetID())
+
+        storageNode.SetFileName(niftiPath)
+
+        # (opzionale) se vuoi “marcare” che ora è stato esportato:
+        # volumeNode.SetAttribute("ExportedToNifti", "1")
+
+        return niftiPath
+    
+    def needsNiftiExport(self, volumeNode):
+        storage = volumeNode.GetStorageNode()
+        fn = (storage.GetFileName() if storage else "") or ""
+        fn = fn.lower()
+        return not (fn.endswith(".nii") or fn.endswith(".nii.gz"))
+        
+    
+    
     def loadModels(self, modelFolderPath):
         self.models = []
         for fold in range(5):
@@ -789,18 +890,7 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
                 mask_array_T1CE = resized_mask_T1CE.cpu().numpy().squeeze()
                 
                 
-                """
-                out_channels = []
-                for c in range(final_prediction.shape[1]):
-                    ch = final_prediction[:, c:c+1]  # [1, 1, D, H, W]
-                    resized = F.interpolate(ch, size=dims_T1CE, mode='trilinear', align_corners=True)  # preserves 0/1
-                    resized = (resized > 0.5).float()  # enforce binary
-                    out_channels.append(resized[0, 0])  # [D, H, W]
-            
                 
-                resized_mask_T1CE = torch.stack(out_channels)
-                mask_array_T1CE = resized_mask_T1CE.cpu().numpy()
-                """
                 
                 dims_T2 = referenceVolume_T2.GetImageData().GetDimensions()
                 #resized_mask_T2 = F.interpolate(final_prediction, size=(dims_T2), mode='nearest')
@@ -857,7 +947,7 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
              
         }
     
-        segment_labels = ["NET", "ED", "ET"]
+        segment_labels = ["NECROSI", "FLAIR", "CONTRASTO"]
         colors = [(1, 0, 0), (0, 1, 0), (0, 0, 1)]  # Rosso, Verde, Blu
         active_segmentation_node = None
         
@@ -878,12 +968,17 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
             print("Valori unici nella maschera:", np.unique(mask_array))
     
             for i, label in enumerate(segment_labels):
-                segmentId = segmentationNode.GetSegmentation().AddEmptySegment(label)
+                segmentId = segmentationNode.GetSegmentation().AddEmptySegment()
+                segment = segmentationNode.GetSegmentation().GetSegment(segmentId)
+                segment.SetName(label)
                 mask = mask_array[i].transpose(2, 0, 1)  
                 
                 print(f"Segmento {label} - Shape: {mask.shape}")
                 slicer.util.updateSegmentBinaryLabelmapFromArray(mask, segmentationNode, segmentId, referenceVolume)
                 segmentationNode.GetSegmentation().GetSegment(segmentId).SetColor(colors[i])
+                
+                
+
     
             # Impostazioni di visualizzazione
             segmentationDisplayNode = segmentationNode.GetDisplayNode()
@@ -965,35 +1060,4 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
             observerTag = sliceNode.AddObserver(vtk.vtkCommand.ModifiedEvent, createOrientationCallback(sliceNode, sliceLogic, volumeNode, defaultOrientation))
             setattr(sliceNode, "_orientationObserver", observerTag)
     
-        slicer.app.processEvents() 
-
-   
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-                
+        slicer.app.processEvents()
