@@ -4,12 +4,12 @@ Created on Wed Feb 26 10:27:14 2025
 
 @author: Utente
 """
-
 import os
 import re
 import glob
 import time
 import platform
+import csv
 
 import torch
 import torch.nn.functional as F
@@ -52,7 +52,10 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
         self.sceneObservers = []
         self.logic = CustomInferenceModulesLogic()
         self.volumeSelectors = {}
+        self.radiomicsVolumeSelectors = {}
+        self.radiomicsSegmentationSelector = None
         self.volumeNodes = []
+        self.segmentationNodes = []
 
     def setup(self):
         ScriptedLoadableModuleWidget.setup(self)
@@ -111,6 +114,48 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
         self.modifySegmentationButton.setEnabled(False)
         self.modifySegmentationButton.connect('clicked(bool)', self.onModifySegmentation)
 
+        titleLabel = qt.QLabel("Radiomics Feature Extraction")
+        titleLabel.setStyleSheet("font-weight: bold; font-size: 14px; margin-top: 10px; margin-bottom: 5px;")
+        self.layout.addWidget(titleLabel)
+
+        radiomicsInfoLabel = qt.QLabel(
+            "Select the volumes and the refined segmentation, then extract radiomics features."
+        )
+        radiomicsInfoLabel.setWordWrap(True)
+        self.layout.addWidget(radiomicsInfoLabel)
+
+        for modality in ["T1", "T2", "T1CE", "FLAIR"]:
+            rowLayout = qt.QHBoxLayout()
+            rowLayout.setSpacing(10)
+
+            label = qt.QLabel(f"{modality} radiomics volume:")
+            rowLayout.addWidget(label)
+
+            comboBox = qt.QComboBox()
+            comboBox.setSizePolicy(qt.QSizePolicy.Expanding, qt.QSizePolicy.Fixed)
+            rowLayout.addWidget(comboBox)
+
+            self.radiomicsVolumeSelectors[modality] = comboBox
+            self.layout.addLayout(rowLayout)
+
+        rowLayout = qt.QHBoxLayout()
+        rowLayout.setSpacing(10)
+
+        label = qt.QLabel("Segmentation:")
+        rowLayout.addWidget(label)
+
+        self.radiomicsSegmentationSelector = qt.QComboBox()
+        self.radiomicsSegmentationSelector.setSizePolicy(qt.QSizePolicy.Expanding, qt.QSizePolicy.Fixed)
+        rowLayout.addWidget(self.radiomicsSegmentationSelector)
+        self.layout.addLayout(rowLayout)
+
+        self.extractRadiomicsButton = qt.QPushButton("Extract Radiomics Features")
+        self.layout.addWidget(self.extractRadiomicsButton)
+        self.extractRadiomicsButton.setEnabled(True)
+        self.extractRadiomicsButton.connect('clicked(bool)', self.onExtractRadiomicsFeatures)
+
+        self.updateComboBoxes()
+
         self.returnToMainButton = qt.QPushButton("Return to Main")
         self.returnToMainButton.connect('clicked(bool)', self.onReturnToMainButton)
 
@@ -137,13 +182,24 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
         for comboBox in self.volumeSelectors.values():
             self.populateVolumeSelector(comboBox)
 
+        for comboBox in self.radiomicsVolumeSelectors.values():
+            self.populateVolumeSelector(comboBox)
+
+        if self.radiomicsSegmentationSelector is not None:
+            self.populateSegmentationSelector(self.radiomicsSegmentationSelector)
+
     def checkForNewVolumes(self):
         currentVolumeNodes = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
+        currentSegmentationNodes = slicer.util.getNodesByClass("vtkMRMLSegmentationNode")
 
-        if len(currentVolumeNodes) != len(self.volumeNodes):
+        if (
+            len(currentVolumeNodes) != len(self.volumeNodes)
+            or len(currentSegmentationNodes) != len(self.segmentationNodes)
+        ):
             self.updateComboBoxes()
 
         self.volumeNodes = currentVolumeNodes
+        self.segmentationNodes = currentSegmentationNodes
 
     def addSceneObservers(self):
         self.removeSceneObservers()
@@ -178,16 +234,44 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
             qt.QMessageBox.information(self.parent, "Volume Loaded", f"{modality} caricato con successo.")
 
     def populateVolumeSelector(self, comboBox):
+        currentNode = comboBox.itemData(comboBox.currentIndex) if comboBox.currentIndex >= 0 else None
         comboBox.clear()
         volumeNodes = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
+        selectedIndex = -1
     
-        for node in volumeNodes:
+        for idx, node in enumerate(volumeNodes):
             storageNode = node.GetStorageNode()
             if storageNode and storageNode.GetFileName():
                 filePath = storageNode.GetFileName()
-                shortName = os.path.basename(filePath)          
-                comboBox.addItem(shortName, node)              
+                shortName = os.path.basename(filePath)
+            else:
+                shortName = node.GetName()
+
+            comboBox.addItem(shortName, node)
+
+            if currentNode and node.GetID() == currentNode.GetID():
+                selectedIndex = idx
+
+        if selectedIndex >= 0:
+            comboBox.setCurrentIndex(selectedIndex)
     
+        slicer.app.processEvents()
+
+    def populateSegmentationSelector(self, comboBox):
+        currentNode = comboBox.itemData(comboBox.currentIndex) if comboBox.currentIndex >= 0 else None
+        comboBox.clear()
+        segmentationNodes = slicer.util.getNodesByClass("vtkMRMLSegmentationNode")
+        selectedIndex = -1
+
+        for idx, node in enumerate(segmentationNodes):
+            comboBox.addItem(node.GetName(), node)
+
+            if currentNode and node.GetID() == currentNode.GetID():
+                selectedIndex = idx
+
+        if selectedIndex >= 0:
+            comboBox.setCurrentIndex(selectedIndex)
+
         slicer.app.processEvents()
 
     def onConfirmSelection(self):
@@ -249,6 +333,58 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
             self.inferenceButton.setEnabled(True)
             self.confirmSelectionButton.setEnabled(True)
 
+    def onExtractRadiomicsFeatures(self):
+        try:
+            self.extractRadiomicsButton.setEnabled(False)
+
+            image_nodes = {}
+            for modality, comboBox in self.radiomicsVolumeSelectors.items():
+                selectedIndex = comboBox.currentIndex
+                if selectedIndex < 0:
+                    qt.QMessageBox.warning(
+                        self.parent,
+                        "Radiomics Selection Error",
+                        f"Please select a radiomics volume for {modality}."
+                    )
+                    return
+
+                selectedNode = comboBox.itemData(selectedIndex)
+                if not selectedNode:
+                    qt.QMessageBox.warning(
+                        self.parent,
+                        "Radiomics Selection Error",
+                        f"Invalid radiomics volume for {modality}."
+                    )
+                    return
+
+                image_nodes[modality] = selectedNode
+
+            segIndex = self.radiomicsSegmentationSelector.currentIndex
+            if segIndex < 0:
+                qt.QMessageBox.warning(
+                    self.parent,
+                    "Radiomics Selection Error",
+                    "Please select a segmentation."
+                )
+                return
+
+            segmentationNode = self.radiomicsSegmentationSelector.itemData(segIndex)
+            if not segmentationNode:
+                qt.QMessageBox.warning(
+                    self.parent,
+                    "Radiomics Selection Error",
+                    "Invalid segmentation selected."
+                )
+                return
+
+            self.logic.extractRadiomicsFeaturesFromNodes(image_nodes, segmentationNode)
+
+        except Exception as e:
+            qt.QMessageBox.critical(self.parent, "Radiomics Error", str(e))
+
+        finally:
+            self.extractRadiomicsButton.setEnabled(True)
+
     def onReturnToMainButton(self):
         slicer.util.selectModule('CustomInferenceModules')
 
@@ -287,6 +423,20 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.updatingSlice = False
         self.niftiExportDir = os.path.join(slicer.app.temporaryPath, "nifti_from_dicom")
+        desktopPath = os.path.join(os.path.expanduser("~"), "Desktop")
+
+        # Fallback utile su alcuni sistemi/localizzazioni italiane.
+        if not os.path.isdir(desktopPath):
+            scrivaniaPath = os.path.join(os.path.expanduser("~"), "Scrivania")
+            if os.path.isdir(scrivaniaPath):
+                desktopPath = scrivaniaPath
+
+        # Se la cartella Desktop/Scrivania non esiste, viene creata.
+        os.makedirs(desktopPath, exist_ok=True)
+
+        # Tutti i file radiomici verranno salvati qui.
+        self.radiomicsOutputDir = os.path.join(desktopPath, "Radiomics_Features")
+        os.makedirs(self.radiomicsOutputDir, exist_ok=True)
 
         self.transforms = Compose([
             EnsureTyped(keys=["T1", "T2", "FLAIR", "T1CE"]),
@@ -642,7 +792,7 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
 
             if sliceNode.GetOrientationString() in ["Axial", "Sagittal", "Coronal"]:
                 sliceNode.SetOrientation(orientation)
-                sliceNode.RotateToVolumePlane(activeVolume)
+                sliceNode.RotateToVolumePlane(activeVolume) 
                 sliceLogic.FitSliceToAll()
 
         slicer.app.processEvents()
@@ -708,13 +858,33 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
                 all_predictions = []
                 n_models = len(self.models)
 
-                for j, model in enumerate(self.models):
-                    test_output = model(inputs["T1CE"], inputs["T1"], inputs["T2"], inputs["FLAIR"])
-                    test_output = [self.post_trans(x) for x in decollate_batch(test_output)]
-                    all_predictions.append(torch.stack(test_output))
+                #for j, model in enumerate(self.models):
+                    #test_output = model(inputs["T1CE"], inputs["T1"], inputs["T2"], inputs["FLAIR"])
+                    #test_output = [self.post_trans(x) for x in decollate_batch(test_output)]
+                    #all_predictions.append(torch.stack(test_output))
 
                     #pct = 10 + int((j + 1) / n_models * 50)
                     #set_progress(pct, f"Running model {j+1}/{n_models}...")
+                    
+                for j, model in enumerate(self.models):
+                    test_output = model(inputs["T1CE"], inputs["T1"], inputs["T2"], inputs["FLAIR"])
+                
+                    # Probabilità indipendenti dei 3 canali
+                    probs = torch.sigmoid(test_output)
+                
+                    # Canale più probabile per ogni voxel
+                    max_probs, max_classes = torch.max(probs, dim=1, keepdim=True)
+                
+                    # Tengo solo il canale vincente
+                    exclusive_probs = torch.zeros_like(probs)
+                    exclusive_probs.scatter_(1, max_classes, max_probs)
+                
+                    # Sogliatura finale
+                    exclusive_prediction = (exclusive_probs > 0.5).float()
+                
+                    all_predictions.append(exclusive_prediction)
+                
+               
 
                 all_predictions = torch.stack(all_predictions)
                 final_prediction = torch.mode(all_predictions, dim=0)[0]
@@ -808,6 +978,287 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
 
         slicer.app.processEvents()
 
+    def _createRadiomicsExtractor(self):
+        try:
+            from radiomics import featureextractor
+        except ImportError:
+            raise RuntimeError(
+                "PyRadiomics non è installato nell'ambiente Python di Slicer.\n\n"
+                "Installa prima le dipendenze dalla Python console di 3D Slicer con:\n"
+                "slicer.util.pip_install('pyradiomics')\n"
+                "slicer.util.pip_install('scikit-image')\n"
+                "slicer.util.pip_install('trimesh')"
+            )
+
+        extractor = featureextractor.RadiomicsFeatureExtractor(
+            binWidth=25,
+            normalize=True,
+            normalizeScale=100,
+            removeOutliers=3,
+            resampledPixelSpacing=None,
+            interpolator="sitkBSpline",
+            correctMask=True,
+            geometryTolerance=1e-3,
+            preCrop=True
+        )
+
+        # Abilita tutte le classi radiomiche disponibili:
+        # firstorder, shape, glcm, glrlm, glszm, gldm, ngtdm.
+        extractor.enableAllFeatures()
+
+        # Abilita tutti gli image types principali.
+        # LoG viene configurato esplicitamente perché richiede i valori di sigma.
+        extractor.disableAllImageTypes()
+        extractor.enableImageTypeByName("Original")
+        extractor.enableImageTypeByName("Wavelet", customArgs={
+            "wavelet": "coif1",
+            "level": 1
+        })
+        extractor.enableImageTypeByName("LoG", customArgs={
+            "sigma": [1.0, 2.0, 3.0, 4.0, 5.0]
+        })
+        extractor.enableImageTypeByName("Square")
+        extractor.enableImageTypeByName("SquareRoot")
+        extractor.enableImageTypeByName("Logarithm")
+        extractor.enableImageTypeByName("Exponential")
+        extractor.enableImageTypeByName("Gradient")
+
+        # LBP2D richiede scikit-image; LBP3D può richiedere scipy/trimesh.
+        # Se non sono disponibili, il pipeline continua senza interrompersi.
+        try:
+            extractor.enableImageTypeByName("LocalBinaryPattern2D")
+        except Exception as e:
+            print(f"[Radiomics warning] LocalBinaryPattern2D non abilitato: {e}")
+
+        try:
+            extractor.enableImageTypeByName("LocalBinaryPattern3D")
+        except Exception as e:
+            print(f"[Radiomics warning] LocalBinaryPattern3D non abilitato: {e}")
+
+        return extractor
+
+    def extractRadiomicsFeatures(self, progressDialog=None, start_value=0, end_value=100):
+        try:
+            segmentationNode = slicer.util.getNode("Segmentation_original")
+        except slicer.util.MRMLNodeNotFoundException:
+            raise RuntimeError("Segmentazione 'Segmentation_original' non trovata. Esegui prima l'inferenza.")
+
+        image_nodes = {
+            "T1CE": slicer.util.getNode("T1CE_original"),
+            "T1": slicer.util.getNode("T1_original"),
+            "T2": slicer.util.getNode("T2_original"),
+            "FLAIR": slicer.util.getNode("FLAIR_original"),
+        }
+
+        return self.extractRadiomicsFeaturesFromNodes(
+            image_nodes=image_nodes,
+            segmentationNode=segmentationNode,
+            progressDialog=progressDialog,
+            start_value=start_value,
+            end_value=end_value
+        )
+
+    def extractRadiomicsFeaturesFromNodes(self, image_nodes, segmentationNode, progressDialog=None, start_value=0, end_value=100):
+        owns_dialog = False
+        if progressDialog is None:
+            progressDialog = qt.QProgressDialog("Extracting radiomics features...", None, 0, 100)
+            progressDialog.setWindowTitle("Radiomics")
+            progressDialog.setCancelButton(None)
+            progressDialog.setMinimumWidth(350)
+            progressDialog.show()
+            owns_dialog = True
+            slicer.app.processEvents()
+
+        def set_progress(pct, label=None):
+            value = int(start_value + (end_value - start_value) * pct / 100.0)
+            progressDialog.setValue(value)
+            if label:
+                progressDialog.setLabelText(label)
+            slicer.app.processEvents()
+
+        try:
+            set_progress(0, "Preparing PyRadiomics extractor...")
+            extractor = self._createRadiomicsExtractor()
+
+            if segmentationNode is None:
+                raise RuntimeError("Nessuna segmentazione selezionata.")
+
+            if not image_nodes:
+                raise RuntimeError("Nessun volume selezionato per l'estrazione radiomica.")
+
+            segment_names = []
+            segmentation = segmentationNode.GetSegmentation()
+            for i in range(segmentation.GetNumberOfSegments()):
+                segmentId = segmentation.GetNthSegmentID(i)
+                segment = segmentation.GetSegment(segmentId)
+                if segment:
+                    segment_names.append(segment.GetName())
+
+            if not segment_names:
+                raise RuntimeError("La segmentazione selezionata non contiene segmenti.")
+
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            safe_seg_name = self._safeName(segmentationNode.GetName())
+            outDir = os.path.join(self.radiomicsOutputDir, f"{timestamp}_{safe_seg_name}")
+            os.makedirs(outDir, exist_ok=True)
+
+            rows = []
+            total_jobs = len(image_nodes) * len(segment_names)
+            completed_jobs = 0
+
+            for modality, imageNode in image_nodes.items():
+                set_progress(
+                    5 + completed_jobs / max(total_jobs, 1) * 85,
+                    f"Saving image for {modality}..."
+                )
+
+                if imageNode is None:
+                    print(f"[Radiomics warning] Volume non valido per {modality}. Skip.")
+                    continue
+
+                safe_modality = self._safeName(modality)
+                imagePath = os.path.join(outDir, f"{safe_modality}.nrrd")
+                ok = slicer.util.saveNode(imageNode, imagePath)
+                if not ok:
+                    raise RuntimeError(f"Impossibile salvare il volume {modality} in: {imagePath}")
+
+                for segmentName in segment_names:
+                    completed_jobs += 1
+                    set_progress(
+                        5 + completed_jobs / max(total_jobs, 1) * 85,
+                        f"Radiomics: {modality} - {segmentName}..."
+                    )
+
+                    segmentId = segmentationNode.GetSegmentation().GetSegmentIdBySegmentName(segmentName)
+                    if not segmentId:
+                        print(f"[Radiomics warning] Segmento non trovato: {segmentName}")
+                        continue
+
+                    safe_segment = self._safeName(segmentName)
+                    labelmapNode = slicer.mrmlScene.AddNewNodeByClass(
+                        "vtkMRMLLabelMapVolumeNode",
+                        f"Labelmap_{safe_segment}_{safe_modality}"
+                    )
+
+                    segmentIds = vtk.vtkStringArray()
+                    segmentIds.InsertNextValue(segmentId)
+
+                    try:
+                        slicer.modules.segmentations.logic().ExportSegmentsToLabelmapNode(
+                            segmentationNode,
+                            segmentIds,
+                            labelmapNode,
+                            imageNode
+                        )
+
+                        mask_array = slicer.util.arrayFromVolume(labelmapNode)
+                        unique_values = np.unique(mask_array)
+                        print(f"[Radiomics] {modality} - {segmentName} mask values: {unique_values}")
+
+                        if np.count_nonzero(mask_array) == 0:
+                            print(f"[Radiomics warning] ROI vuota: {modality} - {segmentName}. Skip.")
+                            continue
+
+                        maskPath = os.path.join(outDir, f"mask_{safe_segment}_{safe_modality}.nrrd")
+                        ok = slicer.util.saveNode(labelmapNode, maskPath)
+                        if not ok:
+                            raise RuntimeError(f"Impossibile salvare la maschera {segmentName} per {modality} in: {maskPath}")
+
+                        result = extractor.execute(imagePath, maskPath, label=1)
+
+                        row = {
+                            "Modality": modality,
+                            "VolumeNodeName": imageNode.GetName(),
+                            "SegmentationNodeName": segmentationNode.GetName(),
+                            "Segment": segmentName,
+                            "ImagePath": imagePath,
+                            "MaskPath": maskPath,
+                        }
+
+                        for key, value in result.items():
+                            if key.startswith("diagnostics"):
+                                continue
+                            row[key] = value
+
+                        rows.append(row)
+                        print(f"[Radiomics] Estratte feature per {modality} - {segmentName}")
+
+                    except Exception as e:
+                        print(f"[Radiomics ERROR] {modality} - {segmentName}: {e}")
+
+                    finally:
+                        if labelmapNode:
+                            slicer.mrmlScene.RemoveNode(labelmapNode)
+
+            if not rows:
+                raise RuntimeError("Nessuna feature radiomica estratta. Controlla che le ROI non siano vuote.")
+
+            set_progress(95, "Writing XLSX...")
+
+            try:
+                from openpyxl import Workbook
+            except ImportError:
+                raise RuntimeError(
+                    "openpyxl non è installato nell'ambiente Python di Slicer."
+                    "Installa prima la dipendenza dalla Python console di 3D Slicer con:"
+                    "slicer.util.pip_install('openpyxl')"
+                )
+
+            xlsxPath = os.path.join(outDir, "radiomics_features.xlsx")
+            fieldnames = sorted(set().union(*(row.keys() for row in rows)))
+
+            preferred_columns = [
+                "Modality",
+                "VolumeNodeName",
+                "SegmentationNodeName",
+                "Segment",
+                "ImagePath",
+                "MaskPath"
+            ]
+            ordered_fieldnames = preferred_columns + [
+                f for f in fieldnames if f not in preferred_columns
+            ]
+
+            def excel_safe_value(value):
+                if isinstance(value, np.generic):
+                    return value.item()
+                if isinstance(value, np.ndarray):
+                    if value.size == 1:
+                        return value.item()
+                    return str(value.tolist())
+                if isinstance(value, (list, tuple, dict)):
+                    return str(value)
+                return value
+
+            workbook = Workbook()
+            worksheet = workbook.active
+            worksheet.title = "Radiomics"
+
+            worksheet.append(ordered_fieldnames)
+
+            for row in rows:
+                worksheet.append([
+                    excel_safe_value(row.get(column, ""))
+                    for column in ordered_fieldnames
+                ])
+
+            workbook.save(xlsxPath)
+
+            set_progress(100, "Radiomics completed")
+            print(f"[Radiomics] Feature salvate in: {xlsxPath}")
+
+            qt.QMessageBox.information(
+                None,
+                "Radiomics completed",
+                f"Feature radiomiche salvate in:{xlsxPath}"
+            )
+
+            return xlsxPath
+
+        finally:
+            if owns_dialog:
+                progressDialog.close()
+
     def updateSliceViewerLayers(self, segmentationNode=None):
         if segmentationNode is None:
             try:
@@ -856,4 +1307,4 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
             )
             setattr(sliceNode, "_orientationObserver", observerTag)
 
-        slicer.app.processEvents() 
+        slicer.app.processEvents()
