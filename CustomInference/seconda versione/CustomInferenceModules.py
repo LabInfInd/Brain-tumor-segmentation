@@ -1,9 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Wed Feb 26 10:27:14 2025
-
-@author: Utente
-"""
 import os
 import re
 import glob
@@ -492,15 +486,32 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
 
        
         self.fastRegistration = True
-        self.registrationIterations = 600
+        self.registrationIterations = 300
         self.registrationHistogramBins = 32
         self.registrationSamplingPercentage = {
             "T1": 0.02,
             "T2": 0.02,
             "FLAIR": 0.01,
         }
-        self.nativeGeometryMinCoverage = 0.90
-        #self.nativeGeometryMinNMI = 0.020
+        # Registration QC thresholds. For a same-exam multimodal brain study,
+        # spatial overlap must be high before a candidate can participate in
+        # the final selection. Native/same-geometry candidates are held to an
+        # even stricter coverage threshold.
+        self.registrationMinCoverage = {
+            "T1": 0.92,
+            "T2": 0.90,
+            "FLAIR": 0.90,
+        }
+        self.nativeGeometryMinCoverage = {
+            "T1": 0.95,
+            "T2": 0.93,
+            "FLAIR": 0.93,
+        }
+        self.registrationMinNMI = {
+            "T1": 0.015,
+            "T2": 0.015,
+            "FLAIR": 0.015,
+        }
         self.nativeGeometryMinNMI = {
             "T1": 0.030,
             "T2": 0.025,
@@ -1186,13 +1197,21 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
         outputNode.CreateDefaultDisplayNodes()
         return outputNode
 
-    def _runSharedMaskOnReference(self, fixedImage):
+    def _runBrainMask(self, imageNode, maskName, previewName):
+        """Run SwissSkullStripper on one already-resampled volume.
 
-        maskNode = self._exactScalarVolumeNode("Shared_brainmask")
-        previewNode = self._exactScalarVolumeNode("Shared_skullstrip_preview")
+        The returned mask is intentionally kept raw here. Morphological cleanup
+        is applied only after T1CE and FLAIR masks are fused, so a peripheral
+        lesion is less likely to be discarded as a small disconnected component.
+        """
+        if imageNode is None or imageNode.GetImageData() is None:
+            raise RuntimeError(f"Volume non valido per skull stripping: {maskName}")
+
+        maskNode = self._exactScalarVolumeNode(maskName)
+        previewNode = self._exactScalarVolumeNode(previewName)
 
         parameters = {
-            "patientVolume": fixedImage.GetID(),
+            "patientVolume": imageNode.GetID(),
             "patientOutputVolume": previewNode.GetID(),
             "patientMaskLabel": maskNode.GetID(),
         }
@@ -1200,63 +1219,129 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
             slicer.modules.swissskullstripper, None, parameters
         )
         status = cliNode.GetStatusString() if cliNode else "Unknown"
-        errorText = cliNode.GetErrorText() if cliNode and hasattr(cliNode, "GetErrorText") else ""
-        print(f"[Shared skull stripping] {status}")
+        errorText = (
+            cliNode.GetErrorText()
+            if cliNode and hasattr(cliNode, "GetErrorText")
+            else ""
+        )
+        print(f"[Skull stripping {maskName}] {status}")
         if errorText:
-            print(f"[Shared skull stripping] {errorText}")
+            print(f"[Skull stripping {maskName}] {errorText}")
 
         if cliNode is None or "Completed" not in status or "error" in status.lower():
             raise RuntimeError(
-                "SwissSkullStripper non ha prodotto la maschera di riferimento. "
+                f"SwissSkullStripper non ha prodotto {maskName}. "
                 f"Stato: {status}. {errorText}"
             )
 
-        rawMask = slicer.util.arrayFromVolume(maskNode) > 0
-        if not np.any(rawMask):
-            raise RuntimeError("La brain mask condivisa è vuota.")
+        mask = slicer.util.arrayFromVolume(maskNode) > 0
+        if not np.any(mask):
+            raise RuntimeError(f"La brain mask {maskName} e' vuota.")
 
-        # Conserva la componente connessa principale e riempie eventuali fori.
-        cleanedMask = rawMask
+        occupancy = float(np.count_nonzero(mask)) / float(mask.size)
+        self._runtimeSetMetric(f"{maskName}_occupancy_raw", f"{occupancy:.6f}")
+        print(f"[Skull stripping {maskName} QC] raw occupancy={occupancy:.4f}")
+        return maskNode
+
+    def _createCombinedBrainMask(self, t1ceNode, t1Node, t1ceMaskNode=None):
+        """Create a conservative shared mask from T1CE OR registered T1.
+
+        Order of operations: union -> closing -> fill holes -> largest connected
+        component -> one-voxel dilation. The T1 is already resampled on the T1CE
+        grid before its mask is computed, so the voxel-wise OR is geometrically valid.
+        """
+        if t1ceMaskNode is None:
+            t1ceMaskNode = self._runBrainMask(
+                t1ceNode,
+                "T1CE_brainmask",
+                "T1CE_skullstrip_preview",
+            )
+
+        t1MaskNode = self._runBrainMask(
+            t1Node,
+            "T1_brainmask",
+            "T1_skullstrip_preview",
+        )
+
+        t1ceMask = slicer.util.arrayFromVolume(t1ceMaskNode) > 0
+        t1Mask = slicer.util.arrayFromVolume(t1MaskNode) > 0
+
+        if t1ceMask.shape != t1Mask.shape:
+            raise RuntimeError(
+                "T1CE e T1 brain mask non hanno la stessa geometria: "
+                f"T1CE={t1ceMask.shape}, T1={t1Mask.shape}."
+            )
+
+        # Voxel-wise union: a voxel is preserved if either skull-stripper mask
+        # considers it intracranial.
+        combinedMask = np.logical_or(t1ceMask, t1Mask)
+
         try:
             from scipy import ndimage
 
-            labels, count = ndimage.label(rawMask)
+            structure = ndimage.generate_binary_structure(3, 1)
+
+            # Reconnect tiny gaps before connected-component filtering.
+            combinedMask = ndimage.binary_closing(
+                combinedMask, structure=structure, iterations=1
+            )
+            combinedMask = ndimage.binary_fill_holes(combinedMask)
+
+            labels, count = ndimage.label(combinedMask, structure=structure)
             if count > 0:
                 sizes = np.bincount(labels.ravel())
                 sizes[0] = 0
-                cleanedMask = labels == int(np.argmax(sizes))
-            cleanedMask = ndimage.binary_fill_holes(cleanedMask)
-            cleanedMask = ndimage.binary_closing(
-                cleanedMask,
-                structure=ndimage.generate_binary_structure(3, 1),
-                iterations=1,
+                combinedMask = labels == int(np.argmax(sizes))
+
+            # Small safety margin against skull-strip truncation at the cortex.
+            combinedMask = ndimage.binary_dilation(
+                combinedMask, structure=structure, iterations=1
             )
         except Exception as exc:
-            print(f"[Shared skull stripping] Pulizia scipy non applicata: {exc}")
+            print(f"[Combined brain mask] Pulizia scipy non applicata: {exc}")
 
-        occupancy = float(np.count_nonzero(cleanedMask)) / float(cleanedMask.size)
-        coords = np.argwhere(cleanedMask)
+        if not np.any(combinedMask):
+            raise RuntimeError("La brain mask combinata T1CE+T1 e' vuota.")
+
+        t1ceCount = int(np.count_nonzero(t1ceMask))
+        t1Count = int(np.count_nonzero(t1Mask))
+        combinedCount = int(np.count_nonzero(combinedMask))
+        occupancy = float(combinedCount) / float(combinedMask.size)
+        coords = np.argwhere(combinedMask)
         bbox = tuple(coords.min(axis=0)) + tuple(coords.max(axis=0))
+
         print(
-            f"[Shared skull stripping QC] occupancy={occupancy:.4f}, "
-            f"bbox KJI={bbox}"
+            "[Combined brain mask QC] "
+            f"T1CE={t1ceCount}, T1={t1Count}, UNION+cleanup={combinedCount}, "
+            f"occupancy={occupancy:.4f}, bbox KJI={bbox}"
         )
+        self._runtimeSetMetric("brainmask_t1ce_voxels", t1ceCount)
+        self._runtimeSetMetric("brainmask_t1_voxels", t1Count)
+        self._runtimeSetMetric("brainmask_combined_voxels", combinedCount)
         self._runtimeSetMetric("brainmask_occupancy", f"{occupancy:.6f}")
         self._runtimeSetMetric("brainmask_bbox_kji", str(bbox))
 
         if occupancy < 0.02 or occupancy > 0.70:
             raise RuntimeError(
-                "Brain mask non plausibile: occupazione "
-                f"{occupancy:.1%} del volume. Controllare T1CE e SwissSkullStripper."
+                "Brain mask combinata non plausibile: occupazione "
+                f"{occupancy:.1%} del volume. Controllare T1CE, T1 e SwissSkullStripper."
             )
 
-        self._copyVolumeToNode(
-            fixedImage,
+        sharedMaskNode = self._copyVolumeToNode(
+            t1ceNode,
             "Shared_brainmask",
-            cleanedMask.astype(np.uint8),
+            combinedMask.astype(np.uint8),
         )
-        self.sharedBrainMaskNodeID = maskNode.GetID()
-        return maskNode
+        self.sharedBrainMaskNodeID = sharedMaskNode.GetID()
+        return sharedMaskNode
+
+    def _runSharedMaskOnReference(self, fixedImage):
+        """Create the initial T1CE mask used as QC support for T1 registration."""
+        return self._runBrainMask(
+            fixedImage,
+            "T1CE_brainmask",
+            "T1CE_skullstrip_preview",
+        )
 
     @staticmethod
     def _normalizedMutualInformation(valuesA, valuesB, bins=64):
@@ -1513,23 +1598,43 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
     ):
         if quality is None:
             return False
-    
+
         if native:
-            minimumCoverage = self.nativeGeometryMinCoverage
+            minimumCoverage = self.nativeGeometryMinCoverage.get(
+                modality, 0.93
+            )
             minimumNMI = self.nativeGeometryMinNMI.get(
-                modality,
-                0.030,
+                modality, 0.030
             )
         else:
-            minimumCoverage = 0.75
-            minimumNMI = 0.015
-    
+            minimumCoverage = self.registrationMinCoverage.get(
+                modality, 0.90
+            )
+            minimumNMI = self.registrationMinNMI.get(
+                modality, 0.015
+            )
+
         return (
             quality.get("coverage", 0.0) >= minimumCoverage
             and quality.get("nmi", 0.0) >= minimumNMI
         )
 
-   
+    def _registrationCandidateIsNative(self, candidate):
+        return candidate.get("initialization") in {
+            "SameGeometry",
+            "NativeGeometry",
+        }
+
+    def _acceptableRegistrationCandidates(self, candidates, modality):
+        return [
+            candidate
+            for candidate in candidates
+            if self._registrationQualityIsAcceptable(
+                candidate,
+                native=self._registrationCandidateIsNative(candidate),
+                modality=modality,
+            )
+        ]
 
     def _finalizeRegistrationCandidate(self, best, modality):
         finalVolume = self._copyVolumeToNode(
@@ -1561,41 +1666,72 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
 
     def _registerOneModality(self, fixedImage, movingImage, modality, fixedMaskNode):
 
-        candidates = []
+        evaluatedCandidates = 0
 
-        # Caso piu' rapido: stessa griglia fisica. Non viene eseguita alcuna CLI.
+        def record_candidate(initialization, outputNode, transformNode, quality):
+            nonlocal evaluatedCandidates
+            evaluatedCandidates += 1
+            candidate = {
+                "initialization": initialization,
+                "output": outputNode,
+                "transform": transformNode,
+                **quality,
+            }
+            print(
+                f"[Registration QC] {modality} / {initialization}: "
+                f"NMI={quality['nmi']:.4f}, "
+                f"coverage={quality['coverage']:.3f}, "
+                f"score={quality['score']:.4f}"
+            )
+            return candidate
+
+        def accept_and_finalize(candidate, native):
+            if not self._registrationQualityIsAcceptable(
+                candidate, native=native, modality=modality
+            ):
+                return None
+
+            print(
+                f"[Registration fast path] {modality}: "
+                f"{candidate['initialization']} accettata; stop ricerca candidati."
+            )
+            self._runtimeSetMetric(
+                f"registration_{modality}_acceptable_candidates", 1
+            )
+            self._runtimeSetMetric(
+                f"registration_{modality}_evaluated_candidates",
+                evaluatedCandidates,
+            )
+            return self._finalizeRegistrationCandidate(candidate, modality)
+
+        failedCandidates = []
+
+        # 1) Fast path: se le geometrie coincidono fisicamente, non eseguire BRAINSFit.
         if self.fastRegistration and self._samePhysicalGeometry(
             fixedImage, movingImage
         ):
             quality = self._registrationQuality(
                 fixedImage, movingImage, fixedMaskNode
             )
-            print(
-                f"[Registration QC] {modality} / SameGeometry: "
-                f"NMI={quality['nmi']:.4f}, "
-                f"coverage={quality['coverage']:.3f}, "
-                f"score={quality['score']:.4f}"
+            outputNode = self._copyVolumeToNode(
+                movingImage, f"__REG_{modality}_SameGeometry"
             )
-            if self._registrationQualityIsAcceptable(quality, native=True, modality=modality):
-                outputNode = self._copyVolumeToNode(
-                    movingImage, f"__REG_{modality}_SameGeometry"
-                )
-                transformNode = self._exactLinearTransformNode(
-                    f"__REG_{modality}_SameGeometry_transform"
-                )
-                identity = vtk.vtkMatrix4x4()
-                identity.Identity()
-                transformNode.SetMatrixTransformToParent(identity)
-                best = {
-                    "initialization": "SameGeometry",
-                    "output": outputNode,
-                    "transform": transformNode,
-                    **quality,
-                }
-                return self._finalizeRegistrationCandidate(best, modality)
+            transformNode = self._exactLinearTransformNode(
+                f"__REG_{modality}_SameGeometry_transform"
+            )
+            identity = vtk.vtkMatrix4x4()
+            identity.Identity()
+            transformNode.SetMatrixTransformToParent(identity)
 
-        # Ricampionamento nativo: usa qform/sform o la matrice IJK->RAS senza
-        # ottimizzazione. Per NIfTI gia' coregistrati e' normalmente sufficiente.
+            candidate = record_candidate(
+                "SameGeometry", outputNode, transformNode, quality
+            )
+            result = accept_and_finalize(candidate, native=True)
+            if result is not None:
+                return result
+            failedCandidates.append(candidate)
+
+        # 2) Ricampionamento nativo sulla griglia T1CE. Se passa il QC, basta questo.
         success, outputNode, transformNode, status, errorText = (
             self._runIdentityResampleCandidate(
                 fixedImage, movingImage, modality
@@ -1605,38 +1741,23 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
             quality = self._registrationQuality(
                 fixedImage, outputNode, fixedMaskNode
             )
-            print(
-                f"[Registration QC] {modality} / NativeGeometry: "
-                f"NMI={quality['nmi']:.4f}, "
-                f"coverage={quality['coverage']:.3f}, "
-                f"score={quality['score']:.4f}"
+            candidate = record_candidate(
+                "NativeGeometry", outputNode, transformNode, quality
             )
-            nativeCandidate = {
-                "initialization": "NativeGeometry",
-                "output": outputNode,
-                "transform": transformNode,
-                **quality,
-            }
-            candidates.append(nativeCandidate)
+            result = accept_and_finalize(candidate, native=True)
+            if result is not None:
+                return result
+            failedCandidates.append(candidate)
 
-            if (
-                self.fastRegistration
-                and self._registrationQualityIsAcceptable(
-                    quality, native=True, modality=modality,
-                )
-            ):
-                print(
-                    f"[Registration fast path] {modality}: "
-                    "geometria nativa accettata; BRAINSFit non necessario."
-                )
-                return self._finalizeRegistrationCandidate(
-                    nativeCandidate, modality
-                )
-
-        # Fallback: due inizializzazioni rigide. MomentsAlign viene provata solo
-        # se nessun candidato precedente supera i controlli minimi.
-        initializationModes = ["Off", "useGeometryAlign"]
+        # 3) BRAINSFit viene eseguito soltanto se i fast path non superano il QC.
+        # Ogni inizializzazione viene valutata in sequenza e ci si ferma appena
+        # compare un candidato accettabile.
+        initializationModes = ["Off", "useGeometryAlign", "useMomentsAlign"]
         for candidateIndex, initializationMode in enumerate(initializationModes):
+            print(
+                f"[Registration] {modality}: BRAINSFit / "
+                f"{initializationMode} ({candidateIndex + 1}/{len(initializationModes)})"
+            )
             success, outputNode, transformNode, status, errorText = (
                 self._runBrainsFitCandidate(
                     fixedImage,
@@ -1652,82 +1773,40 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
             quality = self._registrationQuality(
                 fixedImage, outputNode, fixedMaskNode
             )
-            print(
-                f"[Registration QC] {modality} / {initializationMode}: "
-                f"NMI={quality['nmi']:.4f}, "
-                f"coverage={quality['coverage']:.3f}, "
-                f"score={quality['score']:.4f}"
+            candidate = record_candidate(
+                initializationMode, outputNode, transformNode, quality
             )
-            candidates.append({
-                "initialization": initializationMode,
-                "output": outputNode,
-                "transform": transformNode,
-                **quality,
-            })
+            result = accept_and_finalize(candidate, native=False)
+            if result is not None:
+                return result
+            failedCandidates.append(candidate)
 
-        acceptable = [
-            candidate for candidate in candidates
-            if self._registrationQualityIsAcceptable(candidate)
-        ]
-
-        if not acceptable:
-            initializationMode = "useMomentsAlign"
-            success, outputNode, transformNode, status, errorText = (
-                self._runBrainsFitCandidate(
-                    fixedImage,
-                    movingImage,
-                    modality,
-                    initializationMode,
-                    len(initializationModes),
-                )
-            )
-            if success:
-                quality = self._registrationQuality(
-                    fixedImage, outputNode, fixedMaskNode
-                )
-                print(
-                    f"[Registration QC] {modality} / {initializationMode}: "
-                    f"NMI={quality['nmi']:.4f}, "
-                    f"coverage={quality['coverage']:.3f}, "
-                    f"score={quality['score']:.4f}"
-                )
-                candidates.append({
-                    "initialization": initializationMode,
-                    "output": outputNode,
-                    "transform": transformNode,
-                    **quality,
-                })
-
-        if not candidates:
-            self._cleanupRegistrationCandidates()
-            raise RuntimeError(
-                f"Nessun tentativo di registrazione e' riuscito per {modality}."
-            )
-
-        preference = {
-            "SameGeometry": 0,
-            "NativeGeometry": 1,
-            "Off": 2,
-            "useGeometryAlign": 3,
-            "useMomentsAlign": 4,
-        }
-        candidates.sort(
-            key=lambda item: (
-                -item["score"],
-                preference.get(item["initialization"], 99),
-            )
+        self._runtimeSetMetric(
+            f"registration_{modality}_acceptable_candidates", 0
         )
-        best = candidates[0]
+        self._runtimeSetMetric(
+            f"registration_{modality}_evaluated_candidates",
+            evaluatedCandidates,
+        )
 
-        if best["coverage"] < 0.60 or best["nmi"] < 0.015:
+        if failedCandidates:
+            details = "\n".join(
+                f"  - {candidate['initialization']}: "
+                f"NMI={candidate['nmi']:.4f}, "
+                f"coverage={candidate['coverage']:.1%}, "
+                f"score={candidate['score']:.4f}"
+                for candidate in failedCandidates
+            )
             self._cleanupRegistrationCandidates()
             raise RuntimeError(
-                f"Registrazione {modality} non affidabile: "
-                f"NMI={best['nmi']:.4f}, coverage={best['coverage']:.1%}. "
-                "Controllare che le quattro serie appartengano allo stesso esame."
+                f"Nessuna registrazione accettabile per {modality}.\n"
+                f"Candidati valutati:\n{details}"
             )
 
-        return self._finalizeRegistrationCandidate(best, modality)
+        self._cleanupRegistrationCandidates()
+        raise RuntimeError(
+            f"Nessun tentativo di registrazione e' riuscito per {modality}."
+        )
 
     def _writeRegistrationQC(self):
         if not getattr(self, "registrationQC", None):
@@ -1754,15 +1833,40 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
         if fixedImage is None or fixedImage.GetImageData() is None:
             raise RuntimeError("T1CE non valida: impossibile creare il riferimento.")
 
-
+        # T1CE defines the common physical grid.
         fixedOriginal = self._copyVolumeToNode(
             fixedImage, "T1CE_original"
         )
-
-        fixedMaskNode = self._runSharedMaskOnReference(fixedOriginal)
         self.registrationQC = []
 
-        for modality in ["T1", "T2", "FLAIR"]:
+        # 1) Initial T1CE mask: used only as registration QC support for T1.
+        t1ceMaskNode = self._runSharedMaskOnReference(fixedOriginal)
+
+        # 2) Register T1 first. Its registered mask is then fused with the T1CE
+        #    mask to build the final shared skull-stripping mask.
+        t1Image = self._selectedInputNode("T1")
+        if t1Image is None or t1Image.GetImageData() is None:
+            raise RuntimeError("Volume non valido o mancante: T1")
+
+        self._registerOneModality(
+            fixedOriginal,
+            t1Image,
+            "T1",
+            t1ceMaskNode,
+        )
+
+        t1Original = slicer.util.getNode("T1_original")
+
+        # 3) Conservative multimodal brain mask: T1CE OR registered T1, then
+        #    closing/fill/largest-component and a one-voxel safety dilation.
+        sharedMaskNode = self._createCombinedBrainMask(
+            fixedOriginal,
+            t1Original,
+            t1ceMaskNode=t1ceMaskNode,
+        )
+
+        # 4) Register T2 and FLAIR using the final shared mask for QC.
+        for modality in ["T2", "FLAIR"]:
             movingImage = self._selectedInputNode(modality)
             if movingImage is None or movingImage.GetImageData() is None:
                 raise RuntimeError(f"Volume non valido o mancante: {modality}")
@@ -1771,7 +1875,7 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
                 fixedOriginal,
                 movingImage,
                 modality,
-                fixedMaskNode,
+                sharedMaskNode,
             )
 
         registrationQCPath = self._writeRegistrationQC()
@@ -1779,7 +1883,10 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
         self._assertInferenceGeometry(
             ["T1_original", "T2_original", "T1CE_original", "FLAIR_original"]
         )
-        print("Registrazione robusta completata sulla griglia T1CE")
+        print(
+            "Registrazione robusta completata sulla griglia T1CE; "
+            "Shared_brainmask costruita da T1CE+T1."
+        )
 
     def runSkullStripping(self):
 
