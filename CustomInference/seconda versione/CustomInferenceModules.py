@@ -5,6 +5,8 @@ import time
 import platform
 import csv
 import traceback
+import tempfile
+import shutil
 from contextlib import contextmanager
 
 try:
@@ -132,25 +134,14 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
         titleLabel.setStyleSheet("font-weight: bold; font-size: 14px; margin-top: 10px; margin-bottom: 5px;")
         self.layout.addWidget(titleLabel)
 
-        radiomicsInfoLabel = qt.QLabel(
-            "Select the volumes and the refined segmentation, then extract radiomics features."
+        
+
+        originalsLabel = qt.QLabel(
+            "Fixed radiomics inputs: T1_original | T2_original | "
+            "T1CE_original | FLAIR_original"
         )
-        radiomicsInfoLabel.setWordWrap(True)
-        self.layout.addWidget(radiomicsInfoLabel)
-
-        for modality in ["T1", "T2", "T1CE", "FLAIR"]:
-            rowLayout = qt.QHBoxLayout()
-            rowLayout.setSpacing(10)
-
-            label = qt.QLabel(f"{modality} radiomics volume:")
-            rowLayout.addWidget(label)
-
-            comboBox = qt.QComboBox()
-            comboBox.setSizePolicy(qt.QSizePolicy.Expanding, qt.QSizePolicy.Fixed)
-            rowLayout.addWidget(comboBox)
-
-            self.radiomicsVolumeSelectors[modality] = comboBox
-            self.layout.addLayout(rowLayout)
+        originalsLabel.setWordWrap(True)
+        self.layout.addWidget(originalsLabel)
 
         rowLayout = qt.QHBoxLayout()
         rowLayout.setSpacing(10)
@@ -359,34 +350,12 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
         try:
             self.extractRadiomicsButton.setEnabled(False)
 
-            image_nodes = {}
-            for modality, comboBox in self.radiomicsVolumeSelectors.items():
-                selectedIndex = comboBox.currentIndex
-                if selectedIndex < 0:
-                    qt.QMessageBox.warning(
-                        self.parent,
-                        "Radiomics Selection Error",
-                        f"Please select a radiomics volume for {modality}."
-                    )
-                    return
-
-                selectedNode = comboBox.itemData(selectedIndex)
-                if not selectedNode:
-                    qt.QMessageBox.warning(
-                        self.parent,
-                        "Radiomics Selection Error",
-                        f"Invalid radiomics volume for {modality}."
-                    )
-                    return
-
-                image_nodes[modality] = selectedNode
-
             segIndex = self.radiomicsSegmentationSelector.currentIndex
             if segIndex < 0:
                 qt.QMessageBox.warning(
                     self.parent,
                     "Radiomics Selection Error",
-                    "Please select a segmentation."
+                    "Please select the final/refined segmentation."
                 )
                 return
 
@@ -399,7 +368,11 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
                 )
                 return
 
-            self.logic.extractRadiomicsFeaturesFromNodes(image_nodes, segmentationNode)
+            # Images are intentionally NOT user-selectable: the standardized
+            # radiomics pipeline always uses the registered *_original volumes.
+            self.logic.extractRadiomicsFeatures(
+                segmentationNode=segmentationNode
+            )
 
         except Exception as e:
             qt.QMessageBox.critical(self.parent, "Radiomics Error", str(e))
@@ -483,6 +456,26 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
         self.modelSpacing = (1.0, 1.0, 1.0)
         self.modelSpatialSize = (192, 192, 150)
         self.cropMargin = (8, 8, 5)
+
+        # Standard radiomics specification. Radiomics is always computed from
+        # the registered *_original volumes. The user may select/refine only
+        # the segmentation. A COPY of each original volume is skull-stripped
+        # with Shared_brainmask BEFORE intensity normalization. Mean/std are
+        # estimated only from finite, non-zero voxels inside that brain mask.
+        # The z-score is clipped at +/-3 SD and scaled by 100; PyRadiomics
+        # internal normalization is therefore disabled. Texture features are
+        # always computed after isotropic 1 mm resampling by PyRadiomics.
+        self.radiomicsTargetSpacing = (1.0, 1.0, 1.0)
+        self.radiomicsBinWidth = 10.0
+        self.radiomicsNormalizeScale = 100.0
+        self.radiomicsOutlierSigma = 3.0
+        # Refined tumour ROIs should remain inside the conservative shared brain
+        # mask. A tiny tolerance is allowed for rasterization/border effects.
+        self.radiomicsMaxROIFractionOutsideBrain = 0.001
+        # Intermediate NRRD files are required by the current PyRadiomics call,
+        # but they are temporary implementation details. Keep them only when
+        # explicitly debugging/reproducing a single extraction.
+        self.keepRadiomicsIntermediateFiles = False
 
        
         self.fastRegistration = True
@@ -2596,39 +2589,35 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
             )
 
         extractor = featureextractor.RadiomicsFeatureExtractor(
-            binWidth=25,
-            normalize=True,
-            normalizeScale=100,
-            removeOutliers=3,
-            resampledPixelSpacing=None,
+            binWidth=float(self.radiomicsBinWidth),
+            # Normalization is performed explicitly and identically in both the
+            # Slicer and standalone pipelines, only on finite non-zero voxels.
+            normalize=False,
+            removeOutliers=None,
+            resampledPixelSpacing=list(self.radiomicsTargetSpacing),
             interpolator="sitkBSpline",
-            correctMask=True,
-            geometryTolerance=1e-3,
-            preCrop=True
+            # Masks are exported by Slicer directly on the selected image grid.
+            # A geometry mismatch should therefore fail instead of being hidden.
+            correctMask=False,
+            geometryTolerance=1e-5,
+            preCrop=True,
         )
 
-        # Abilita tutte le classi radiomiche disponibili:
-        # firstorder, shape, glcm, glrlm, glszm, gldm, ngtdm.
         extractor.enableAllFeatures()
-
-        # Abilita tutti gli image types principali.
-        # LoG viene configurato esplicitamente perché richiede i valori di sigma.
         extractor.disableAllImageTypes()
         extractor.enableImageTypeByName("Original")
         extractor.enableImageTypeByName("Wavelet", customArgs={
             "wavelet": "coif1",
-            "level": 1
+            "level": 1,
         })
         extractor.enableImageTypeByName("LoG", customArgs={
-            "sigma": [1.0, 2.0, 3.0, 4.0, 5.0]
+            "sigma": [1.0, 2.0, 3.0, 4.0, 5.0],
         })
         extractor.enableImageTypeByName("Square")
         extractor.enableImageTypeByName("SquareRoot")
         extractor.enableImageTypeByName("Logarithm")
         extractor.enableImageTypeByName("Exponential")
         extractor.enableImageTypeByName("Gradient")
-
-        # LBP2D richiede scikit-image; LBP3D può richiedere scipy/trimesh.
 
         try:
             extractor.enableImageTypeByName("LocalBinaryPattern2D")
@@ -2642,189 +2631,468 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
 
         return extractor
 
-    def extractRadiomicsFeatures(self, progressDialog=None, start_value=0, end_value=100):
-        try:
-            segmentationNode = slicer.util.getNode("Segmentation_original")
-        except slicer.util.MRMLNodeNotFoundException:
-            raise RuntimeError("Segmentazione 'Segmentation_original' non trovata. Esegui prima l'inferenza.")
-
-        image_nodes = {
-            "T1CE": slicer.util.getNode("T1CE_original"),
-            "T1": slicer.util.getNode("T1_original"),
-            "T2": slicer.util.getNode("T2_original"),
-            "FLAIR": slicer.util.getNode("FLAIR_original"),
+    def _radiomicsOriginalNodes(self):
+        """Return the only image nodes allowed by the standardized pipeline."""
+        nodeNames = {
+            "T1": "T1_original",
+            "T2": "T2_original",
+            "T1CE": "T1CE_original",
+            "FLAIR": "FLAIR_original",
         }
+        imageNodes = {}
+        missing = []
+        for modality, nodeName in nodeNames.items():
+            try:
+                node = slicer.util.getNode(nodeName)
+            except slicer.util.MRMLNodeNotFoundException:
+                node = None
+            if node is None or node.GetImageData() is None:
+                missing.append(nodeName)
+            else:
+                imageNodes[modality] = node
 
+        if missing:
+            raise RuntimeError(
+                "Mancano i volumi radiomici standardizzati: " + ", ".join(missing)
+            )
+
+        # All registered originals must share the T1CE physical grid before any
+        # radiomics-specific resampling is performed by PyRadiomics.
+        self._assertInferenceGeometry(list(nodeNames.values()))
+        return imageNodes
+
+    def _radiomicsBrainMaskArray(self, referenceNode):
+        """Return Shared_brainmask on the common *_original grid.
+
+        The inference preprocessing constructs Shared_brainmask on the T1CE
+        reference grid and all *_original volumes are required to share this
+        same physical geometry. Radiomics therefore uses this mask to remove
+        extracranial tissues before estimating normalization statistics.
+        """
+        try:
+            maskNode = slicer.util.getNode("Shared_brainmask")
+        except slicer.util.MRMLNodeNotFoundException:
+            maskNode = None
+        if maskNode is None or maskNode.GetImageData() is None:
+            raise RuntimeError(
+                "Shared_brainmask non disponibile. La radiomica standardizzata "
+                "richiede la brain mask generata durante il preprocessing, "
+                "per rimuovere skull/tessuti extracranici prima della normalizzazione."
+            )
+
+        referenceDims = tuple(referenceNode.GetImageData().GetDimensions())
+        maskDims = tuple(maskNode.GetImageData().GetDimensions())
+        if maskDims != referenceDims:
+            raise RuntimeError(
+                f"Shared_brainmask con dimensioni {maskDims}, attese {referenceDims}."
+            )
+
+        referenceMatrix = self._ijkToRasArray(referenceNode)
+        maskMatrix = self._ijkToRasArray(maskNode)
+        maxDifference = float(np.max(np.abs(referenceMatrix - maskMatrix)))
+        if maxDifference > 1e-4:
+            raise RuntimeError(
+                "Shared_brainmask non condivide la geometria fisica degli *_original "
+                f"(differenza massima IJK->RAS={maxDifference:.6g})."
+            )
+
+        maskKJI = np.asarray(slicer.util.arrayFromVolume(maskNode)) > 0
+        brainVoxelCount = int(np.count_nonzero(maskKJI))
+        if brainVoxelCount < 2:
+            raise RuntimeError("Shared_brainmask vuota o non valida.")
+
+        return maskNode, maskKJI.astype(bool, copy=False)
+
+    def _normalizeRadiomicsArray(self, array, brainMask):
+        """Skull-strip a copy, then normalize intensities inside brain only.
+
+        The source *_original volume is never modified. Extracranial voxels are
+        set to zero in the temporary radiomics copy. Mean/std are estimated on
+        finite, non-zero voxels INSIDE Shared_brainmask. The z-score is clipped
+        to +/- radiomicsOutlierSigma and multiplied by radiomicsNormalizeScale.
+        """
+        source = np.asarray(array, dtype=np.float32)
+        brainMask = np.asarray(brainMask, dtype=bool)
+        if source.shape != brainMask.shape:
+            raise RuntimeError(
+                f"Shape immagine/brain mask incompatibile: {source.shape} vs {brainMask.shape}."
+            )
+
+        finiteInsideBrain = brainMask & np.isfinite(source)
+        valid = finiteInsideBrain & (source != 0)
+        count = int(np.count_nonzero(valid))
+        brainVoxelCount = int(np.count_nonzero(brainMask))
+        if count < 2:
+            raise RuntimeError(
+                "Volume radiomico senza un numero sufficiente di voxel cerebrali non-zero."
+            )
+
+        values = source[valid].astype(np.float64, copy=False)
+        mean = float(values.mean())
+        std = float(values.std())
+        if not np.isfinite(std) or std < 1e-8:
+            raise RuntimeError(
+                f"Deviazione standard non valida per normalizzazione radiomica: {std}"
+            )
+
+        normalizedValues = (values - mean) / std
+        sigma = self.radiomicsOutlierSigma
+        if sigma is not None:
+            normalizedValues = np.clip(
+                normalizedValues, -float(sigma), float(sigma)
+            )
+        normalizedValues *= float(self.radiomicsNormalizeScale)
+
+        # Explicit skull stripping: the temporary radiomics image is zero
+        # everywhere outside Shared_brainmask. Original MRML volumes are untouched.
+        output = np.zeros(source.shape, dtype=np.float32)
+        output[valid] = normalizedValues.astype(np.float32)
+        output[~np.isfinite(output)] = 0.0
+
+        stats = {
+            "NormalizationMask": "Shared_brainmask",
+            "SkullStrippingBeforeNormalization": True,
+            "BrainMaskVoxelCount": brainVoxelCount,
+            "NormalizationMean": mean,
+            "NormalizationStd": std,
+            "NormalizationVoxelCount": count,
+            "NormalizationVoxelFractionOfBrainMask": float(
+                count / max(brainVoxelCount, 1)
+            ),
+            "NormalizationScale": float(self.radiomicsNormalizeScale),
+            "NormalizationOutlierSigma": (
+                "" if sigma is None else float(sigma)
+            ),
+        }
+        return output, stats
+
+    def _prepareRadiomicsNormalizedNode(self, imageNode, modality, brainMaskKJI):
+        arrayKJI = np.asarray(
+            slicer.util.arrayFromVolume(imageNode), dtype=np.float32
+        )
+        normalizedKJI, stats = self._normalizeRadiomicsArray(
+            arrayKJI, brainMaskKJI
+        )
+        nodeName = f"__RADIOMICS_{modality}_BRAIN_NORMALIZED"
+        normalizedNode = self._copyVolumeToNode(
+            imageNode, nodeName, normalizedKJI
+        )
+        return normalizedNode, stats
+
+    def extractRadiomicsFeatures(
+        self,
+        progressDialog=None,
+        start_value=0,
+        end_value=100,
+        segmentationNode=None,
+    ):
+        """Run the standardized radiomics pipeline.
+
+        Only the segmentation is selectable/refinable. Image inputs are always
+        T1_original, T2_original, T1CE_original and FLAIR_original.
+        """
+        if segmentationNode is None:
+            try:
+                segmentationNode = slicer.util.getNode("Segmentation_original")
+            except slicer.util.MRMLNodeNotFoundException:
+                raise RuntimeError(
+                    "Segmentazione 'Segmentation_original' non trovata. "
+                    "Seleziona o crea prima la segmentazione finale."
+                )
+
+        imageNodes = self._radiomicsOriginalNodes()
         return self.extractRadiomicsFeaturesFromNodes(
-            image_nodes=image_nodes,
+            image_nodes=imageNodes,
             segmentationNode=segmentationNode,
             progressDialog=progressDialog,
             start_value=start_value,
-            end_value=end_value
+            end_value=end_value,
         )
 
-    def extractRadiomicsFeaturesFromNodes(self, image_nodes, segmentationNode, progressDialog=None, start_value=0, end_value=100):
-        owns_dialog = False
+    def extractRadiomicsFeaturesFromNodes(
+        self,
+        image_nodes,
+        segmentationNode,
+        progressDialog=None,
+        start_value=0,
+        end_value=100,
+    ):
+        """Compatibility entry point, but enforce the fixed *_original inputs."""
+        expectedNodes = self._radiomicsOriginalNodes()
+        if image_nodes is not None:
+            for modality, expectedNode in expectedNodes.items():
+                suppliedNode = image_nodes.get(modality)
+                if suppliedNode is None or suppliedNode.GetID() != expectedNode.GetID():
+                    raise RuntimeError(
+                        "Pipeline radiomica standardizzata: i volumi non sono "
+                        "selezionabili. Usare esclusivamente T1_original, "
+                        "T2_original, T1CE_original e FLAIR_original."
+                    )
+        image_nodes = expectedNodes
+
+        ownsDialog = False
         if progressDialog is None:
-            progressDialog = qt.QProgressDialog("Extracting radiomics features...", None, 0, 100)
+            progressDialog = qt.QProgressDialog(
+                "Extracting standardized radiomics features...", None, 0, 100
+            )
             progressDialog.setWindowTitle("Radiomics")
             progressDialog.setCancelButton(None)
             progressDialog.setMinimumWidth(350)
             progressDialog.show()
-            owns_dialog = True
+            ownsDialog = True
             slicer.app.processEvents()
 
-        def set_progress(pct, label=None):
-            value = int(start_value + (end_value - start_value) * pct / 100.0)
+        def setProgress(percent, label=None):
+            value = int(start_value + (end_value - start_value) * percent / 100.0)
             progressDialog.setValue(value)
             if label:
                 progressDialog.setLabelText(label)
             slicer.app.processEvents()
 
         try:
-            set_progress(0, "Preparing PyRadiomics extractor...")
+            setProgress(0, "Preparing standardized PyRadiomics extractor...")
             extractor = self._createRadiomicsExtractor()
 
             if segmentationNode is None:
                 raise RuntimeError("Nessuna segmentazione selezionata.")
 
-            if not image_nodes:
-                raise RuntimeError("Nessun volume selezionato per l'estrazione radiomica.")
-
-            segment_names = []
             segmentation = segmentationNode.GetSegmentation()
-            for i in range(segmentation.GetNumberOfSegments()):
-                segmentId = segmentation.GetNthSegmentID(i)
+            segmentNames = []
+            for index in range(segmentation.GetNumberOfSegments()):
+                segmentId = segmentation.GetNthSegmentID(index)
                 segment = segmentation.GetSegment(segmentId)
                 if segment:
-                    segment_names.append(segment.GetName())
-
-            if not segment_names:
+                    segmentNames.append(segment.GetName())
+            if not segmentNames:
                 raise RuntimeError("La segmentazione selezionata non contiene segmenti.")
 
+            # Brain mask is defined once on the common *_original/T1CE grid and
+            # reused identically for all four MRI modalities.
+            _, brainMaskKJI = self._radiomicsBrainMaskArray(
+                image_nodes["T1CE"]
+            )
+
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            safe_seg_name = self._safeName(segmentationNode.GetName())
-            outDir = os.path.join(self.radiomicsOutputDir, f"{timestamp}_{safe_seg_name}")
+            safeSegName = self._safeName(segmentationNode.GetName())
+            outDir = os.path.join(
+                self.radiomicsOutputDir,
+                f"{timestamp}_{safeSegName}_STANDARDIZED",
+            )
             os.makedirs(outDir, exist_ok=True)
 
-            rows = []
-            total_jobs = len(image_nodes) * len(segment_names)
-            completed_jobs = 0
-
-            for modality, imageNode in image_nodes.items():
-                set_progress(
-                    5 + completed_jobs / max(total_jobs, 1) * 85,
-                    f"Saving image for {modality}..."
+            if self.keepRadiomicsIntermediateFiles:
+                workDir = os.path.join(outDir, "intermediate_nrrd")
+                os.makedirs(workDir, exist_ok=True)
+            else:
+                workDir = tempfile.mkdtemp(
+                    prefix="custom_inference_radiomics_",
+                    dir=slicer.app.temporaryPath,
                 )
 
-                if imageNode is None:
-                    print(f"[Radiomics warning] Volume non valido per {modality}. Skip.")
-                    continue
+            rows = []
+            totalJobs = len(image_nodes) * len(segmentNames)
+            completedJobs = 0
 
-                safe_modality = self._safeName(modality)
-                imagePath = os.path.join(outDir, f"{safe_modality}.nrrd")
-                ok = slicer.util.saveNode(imageNode, imagePath)
-                if not ok:
-                    raise RuntimeError(f"Impossibile salvare il volume {modality} in: {imagePath}")
-
-                for segmentName in segment_names:
-                    completed_jobs += 1
-                    set_progress(
-                        5 + completed_jobs / max(total_jobs, 1) * 85,
-                        f"Radiomics: {modality} - {segmentName}..."
+            for modality, imageNode in image_nodes.items():
+                normalizedNode = None
+                try:
+                    setProgress(
+                        5 + completedJobs / max(totalJobs, 1) * 85,
+                        f"Standardizing {modality} intensities...",
+                    )
+                    normalizedNode, normalizationStats = (
+                        self._prepareRadiomicsNormalizedNode(
+                            imageNode, modality, brainMaskKJI
+                        )
                     )
 
-                    segmentId = segmentationNode.GetSegmentation().GetSegmentIdBySegmentName(segmentName)
-                    if not segmentId:
-                        print(f"[Radiomics warning] Segmento non trovato: {segmentName}")
-                        continue
-
-                    safe_segment = self._safeName(segmentName)
-                    labelmapNode = slicer.mrmlScene.AddNewNodeByClass(
-                        "vtkMRMLLabelMapVolumeNode",
-                        f"Labelmap_{safe_segment}_{safe_modality}"
+                    safeModality = self._safeName(modality)
+                    imagePath = os.path.join(
+                        workDir, f"{safeModality}_standardized.nrrd"
                     )
-
-                    segmentIds = vtk.vtkStringArray()
-                    segmentIds.InsertNextValue(segmentId)
-
-                    try:
-                        slicer.modules.segmentations.logic().ExportSegmentsToLabelmapNode(
-                            segmentationNode,
-                            segmentIds,
-                            labelmapNode,
-                            imageNode
+                    ok = slicer.util.saveNode(normalizedNode, imagePath)
+                    if not ok:
+                        raise RuntimeError(
+                            f"Impossibile salvare il volume standardizzato {modality}: "
+                            f"{imagePath}"
                         )
 
-                        mask_array = slicer.util.arrayFromVolume(labelmapNode)
-                        unique_values = np.unique(mask_array)
-                        print(f"[Radiomics] {modality} - {segmentName} mask values: {unique_values}")
+                    spacing = tuple(float(v) for v in imageNode.GetSpacing())
+                    voxelPhysicalVolume = float(np.prod(spacing))
 
-                        if np.count_nonzero(mask_array) == 0:
-                            print(f"[Radiomics warning] ROI vuota: {modality} - {segmentName}. Skip.")
+                    for segmentName in segmentNames:
+                        completedJobs += 1
+                        setProgress(
+                            5 + completedJobs / max(totalJobs, 1) * 85,
+                            f"Radiomics: {modality} - {segmentName}...",
+                        )
+
+                        segmentId = segmentation.GetSegmentIdBySegmentName(segmentName)
+                        if not segmentId:
+                            print(f"[Radiomics warning] Segmento non trovato: {segmentName}")
                             continue
 
-                        maskPath = os.path.join(outDir, f"mask_{safe_segment}_{safe_modality}.nrrd")
-                        ok = slicer.util.saveNode(labelmapNode, maskPath)
-                        if not ok:
-                            raise RuntimeError(f"Impossibile salvare la maschera {segmentName} per {modality} in: {maskPath}")
+                        safeSegment = self._safeName(segmentName)
+                        labelmapNode = slicer.mrmlScene.AddNewNodeByClass(
+                            "vtkMRMLLabelMapVolumeNode",
+                            f"__RADIOMICS_MASK_{safeSegment}_{safeModality}",
+                        )
+                        segmentIds = vtk.vtkStringArray()
+                        segmentIds.InsertNextValue(segmentId)
 
-                        result = extractor.execute(imagePath, maskPath, label=1)
+                        try:
+                            # This also handles a manually refined segmentation:
+                            # Slicer exports the chosen segment onto the exact
+                            # standardized-image physical grid using labelmap logic.
+                            slicer.modules.segmentations.logic().ExportSegmentsToLabelmapNode(
+                                segmentationNode,
+                                segmentIds,
+                                labelmapNode,
+                                normalizedNode,
+                            )
 
-                        row = {
-                            "Modality": modality,
-                            "VolumeNodeName": imageNode.GetName(),
-                            "SegmentationNodeName": segmentationNode.GetName(),
-                            "Segment": segmentName,
-                            "ImagePath": imagePath,
-                            "MaskPath": maskPath,
-                        }
-
-                        for key, value in result.items():
-                            if key.startswith("diagnostics"):
+                            maskArray = slicer.util.arrayFromVolume(labelmapNode)
+                            maskVoxelCount = int(np.count_nonzero(maskArray))
+                            uniqueValues = np.unique(maskArray)
+                            print(
+                                f"[Radiomics] {modality} - {segmentName} "
+                                f"mask values={uniqueValues}, voxels={maskVoxelCount}"
+                            )
+                            if maskVoxelCount == 0:
+                                print(
+                                    f"[Radiomics warning] ROI vuota: "
+                                    f"{modality} - {segmentName}. Skip."
+                                )
                                 continue
-                            row[key] = value
 
-                        rows.append(row)
-                        print(f"[Radiomics] Estratte feature per {modality} - {segmentName}")
+                            roiMask = np.asarray(maskArray) > 0
+                            outsideBrainVoxels = int(
+                                np.count_nonzero(roiMask & (~brainMaskKJI))
+                            )
+                            outsideBrainFraction = float(
+                                outsideBrainVoxels / max(maskVoxelCount, 1)
+                            )
+                            if (
+                                outsideBrainFraction
+                                > float(self.radiomicsMaxROIFractionOutsideBrain)
+                            ):
+                                raise RuntimeError(
+                                    f"ROI {segmentName} non contenuta nella Shared_brainmask: "
+                                    f"{outsideBrainVoxels}/{maskVoxelCount} voxel "
+                                    f"({outsideBrainFraction:.3%}) fuori brain mask. "
+                                    "Controllare/refinire segmentazione o brain mask."
+                                )
+                            if outsideBrainVoxels:
+                                print(
+                                    f"[Radiomics warning] {segmentName}: "
+                                    f"{outsideBrainVoxels} voxel ({outsideBrainFraction:.3%}) "
+                                    "fuori Shared_brainmask, entro la tolleranza QC."
+                                )
 
-                    except Exception as e:
-                        print(f"[Radiomics ERROR] {modality} - {segmentName}: {e}")
+                            maskPath = os.path.join(
+                                workDir,
+                                f"mask_{safeSegment}_{safeModality}.nrrd",
+                            )
+                            ok = slicer.util.saveNode(labelmapNode, maskPath)
+                            if not ok:
+                                raise RuntimeError(
+                                    f"Impossibile salvare la maschera {segmentName} "
+                                    f"per {modality}: {maskPath}"
+                                )
 
-                    finally:
-                        if labelmapNode:
-                            slicer.mrmlScene.RemoveNode(labelmapNode)
+                            result = extractor.execute(
+                                imagePath, maskPath, label=1
+                            )
+
+                            row = {
+                                "Modality": modality,
+                                "VolumeNodeName": imageNode.GetName(),
+                                "SegmentationNodeName": segmentationNode.GetName(),
+                                "Segment": segmentName,
+                                "OriginalSpacing": str(spacing),
+                                "RadiomicsTargetSpacing": str(
+                                    tuple(self.radiomicsTargetSpacing)
+                                ),
+                                "MaskVoxelCountOriginalGrid": maskVoxelCount,
+                                "MaskVolumeMM3OriginalGrid": (
+                                    maskVoxelCount * voxelPhysicalVolume
+                                ),
+                                "ROIVoxelsOutsideBrainMask": outsideBrainVoxels,
+                                "ROIFractionOutsideBrainMask": outsideBrainFraction,
+                                "BinWidth": float(self.radiomicsBinWidth),
+                                "IntermediateFilesKept": bool(self.keepRadiomicsIntermediateFiles),
+                                "ImagePath": imagePath if self.keepRadiomicsIntermediateFiles else "TEMPORARY_DELETED_AFTER_EXTRACTION",
+                                "MaskPath": maskPath if self.keepRadiomicsIntermediateFiles else "TEMPORARY_DELETED_AFTER_EXTRACTION",
+                                **normalizationStats,
+                            }
+
+                            # Keep a compact subset of PyRadiomics diagnostics as QC.
+                            diagnosticKeep = {
+                                "diagnostics_Versions_PyRadiomics",
+                                "diagnostics_Versions_SimpleITK",
+                                "diagnostics_Image-original_Spacing",
+                                "diagnostics_Image-original_Size",
+                                "diagnostics_Mask-original_VoxelNum",
+                                "diagnostics_Mask-original_VolumeNum",
+                                "diagnostics_Mask-original_BoundingBox",
+                            }
+                            for key, value in result.items():
+                                if key.startswith("diagnostics") and key not in diagnosticKeep:
+                                    continue
+                                row[key] = value
+
+                            rows.append(row)
+                            print(
+                                f"[Radiomics] Estratte feature standardizzate "
+                                f"per {modality} - {segmentName}"
+                            )
+
+                        except Exception as e:
+                            print(
+                                f"[Radiomics ERROR] {modality} - "
+                                f"{segmentName}: {e}"
+                            )
+                        finally:
+                            if labelmapNode:
+                                slicer.mrmlScene.RemoveNode(labelmapNode)
+
+                finally:
+                    if normalizedNode:
+                        slicer.mrmlScene.RemoveNode(normalizedNode)
 
             if not rows:
-                raise RuntimeError("Nessuna feature radiomica estratta. Controlla che le ROI non siano vuote.")
+                raise RuntimeError(
+                    "Nessuna feature radiomica estratta. Controlla ROI e geometria."
+                )
 
-            set_progress(95, "Writing XLSX...")
-
+            setProgress(95, "Writing XLSX...")
             try:
                 from openpyxl import Workbook
             except ImportError:
                 raise RuntimeError(
-                    "openpyxl non è installato nell'ambiente Python di Slicer."
-                    "Installa prima la dipendenza dalla Python console di 3D Slicer con:"
-                    "slicer.util.pip_install('openpyxl')"
+                    "openpyxl non è installato nell'ambiente Python di Slicer. "
+                    "Installa con: slicer.util.pip_install('openpyxl')"
                 )
 
             xlsxPath = os.path.join(outDir, "radiomics_features.xlsx")
             fieldnames = sorted(set().union(*(row.keys() for row in rows)))
-
-            preferred_columns = [
-                "Modality",
-                "VolumeNodeName",
-                "SegmentationNodeName",
-                "Segment",
-                "ImagePath",
-                "MaskPath"
+            preferredColumns = [
+                "Modality", "VolumeNodeName", "SegmentationNodeName", "Segment",
+                "OriginalSpacing", "RadiomicsTargetSpacing",
+                "MaskVoxelCountOriginalGrid", "MaskVolumeMM3OriginalGrid",
+                "ROIVoxelsOutsideBrainMask", "ROIFractionOutsideBrainMask",
+                "NormalizationMask", "SkullStrippingBeforeNormalization",
+                "BrainMaskVoxelCount", "NormalizationMean", "NormalizationStd",
+                "NormalizationVoxelCount",
+                "NormalizationVoxelFractionOfBrainMask", "NormalizationScale",
+                "NormalizationOutlierSigma", "BinWidth", "IntermediateFilesKept",
+                "ImagePath", "MaskPath",
             ]
-            ordered_fieldnames = preferred_columns + [
-                f for f in fieldnames if f not in preferred_columns
+            orderedFieldnames = preferredColumns + [
+                field for field in fieldnames if field not in preferredColumns
             ]
 
-            def excel_safe_value(value):
+            def excelSafeValue(value):
                 if isinstance(value, np.generic):
                     return value.item()
                 if isinstance(value, np.ndarray):
@@ -2838,30 +3106,56 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
             workbook = Workbook()
             worksheet = workbook.active
             worksheet.title = "Radiomics"
-
-            worksheet.append(ordered_fieldnames)
-
+            worksheet.append(orderedFieldnames)
             for row in rows:
                 worksheet.append([
-                    excel_safe_value(row.get(column, ""))
-                    for column in ordered_fieldnames
+                    excelSafeValue(row.get(column, ""))
+                    for column in orderedFieldnames
                 ])
 
+            qcSheet = workbook.create_sheet("Pipeline_QC")
+            qcSheet.append(["Parameter", "Value"])
+            qcSheet.append(["Image inputs", "T1_original,T2_original,T1CE_original,FLAIR_original"])
+            qcSheet.append(["Segmentation", segmentationNode.GetName()])
+            qcSheet.append(["Radiomics image source", "registered *_original volumes"])
+            qcSheet.append(["Skull stripping before normalization", True])
+            qcSheet.append(["Normalization mask", "Shared_brainmask"])
+            qcSheet.append(["Intensity normalization", "brain-mask finite non-zero z-score; clipped; scaled"])
+            qcSheet.append(["Original volumes modified", False])
+            qcSheet.append(["Normalization scale", float(self.radiomicsNormalizeScale)])
+            qcSheet.append(["Outlier sigma", float(self.radiomicsOutlierSigma)])
+            qcSheet.append(["Target spacing mm", str(tuple(self.radiomicsTargetSpacing))])
+            qcSheet.append(["Bin width", float(self.radiomicsBinWidth)])
+            qcSheet.append(["PyRadiomics normalize", False])
+            qcSheet.append(["PyRadiomics correctMask", False])
+            qcSheet.append(["Mask export", "Slicer segment exported to each image grid"])
+            qcSheet.append(["Max ROI fraction outside brain mask", float(self.radiomicsMaxROIFractionOutsideBrain)])
+            qcSheet.append(["Radiomics resampling", "always enabled via PyRadiomics"])
+            qcSheet.append(["Image interpolation", "sitkBSpline"])
+            qcSheet.append(["Mask interpolation", "nearest-neighbor by PyRadiomics/labelmap handling"])
+            qcSheet.append(["Keep intermediate NRRD files", bool(self.keepRadiomicsIntermediateFiles)])
+
             workbook.save(xlsxPath)
-
-            set_progress(100, "Radiomics completed")
+            setProgress(100, "Radiomics completed")
             print(f"[Radiomics] Feature salvate in: {xlsxPath}")
-
             qt.QMessageBox.information(
                 None,
                 "Radiomics completed",
-                f"Feature radiomiche salvate in:{xlsxPath}"
+                f"Feature radiomiche standardizzate salvate in:\n{xlsxPath}",
             )
-
             return xlsxPath
 
         finally:
-            if owns_dialog:
+            if 'workDir' in locals() and workDir and not self.keepRadiomicsIntermediateFiles:
+                try:
+                    shutil.rmtree(workDir, ignore_errors=False)
+                    print(f"[Radiomics] File intermedi temporanei rimossi: {workDir}")
+                except Exception as cleanupError:
+                    print(
+                        f"[Radiomics warning] Impossibile rimuovere la cartella "
+                        f"temporanea {workDir}: {cleanupError}"
+                    )
+            if ownsDialog:
                 progressDialog.close()
 
     def updateSliceViewerLayers(self, segmentationNode=None):
