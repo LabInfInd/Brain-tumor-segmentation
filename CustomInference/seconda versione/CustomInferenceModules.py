@@ -134,13 +134,7 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
         titleLabel.setStyleSheet("font-weight: bold; font-size: 14px; margin-top: 10px; margin-bottom: 5px;")
         self.layout.addWidget(titleLabel)
 
-        radiomicsInfoLabel = qt.QLabel(
-            "Radiomics always uses T1_original, T2_original, T1CE_original and "
-            "FLAIR_original with the standardized radiomics preprocessing. "
-            "Select only the final/refined segmentation."
-        )
-        radiomicsInfoLabel.setWordWrap(True)
-        self.layout.addWidget(radiomicsInfoLabel)
+        
 
         originalsLabel = qt.QLabel(
             "Fixed radiomics inputs: T1_original | T2_original | "
