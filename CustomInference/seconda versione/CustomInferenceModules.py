@@ -134,7 +134,13 @@ class CustomInferenceModulesWidget(ScriptedLoadableModuleWidget):
         titleLabel.setStyleSheet("font-weight: bold; font-size: 14px; margin-top: 10px; margin-bottom: 5px;")
         self.layout.addWidget(titleLabel)
 
-        
+        radiomicsInfoLabel = qt.QLabel(
+            "Radiomics always uses T1_original, T2_original, T1CE_original and "
+            "FLAIR_original with the standardized radiomics preprocessing. "
+            "Select only the final/refined segmentation."
+        )
+        radiomicsInfoLabel.setWordWrap(True)
+        self.layout.addWidget(radiomicsInfoLabel)
 
         originalsLabel = qt.QLabel(
             "Fixed radiomics inputs: T1_original | T2_original | "
@@ -462,6 +468,8 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
         # the segmentation. A COPY of each original volume is skull-stripped
         # with Shared_brainmask BEFORE intensity normalization. Mean/std are
         # estimated only from finite, non-zero voxels inside that brain mask.
+        # N4 bias-field correction is first estimated inside Shared_brainmask.
+        # The N4-corrected copy is then skull-masked and z-score normalized.
         # The z-score is clipped at +/-3 SD and scaled by 100; PyRadiomics
         # internal normalization is therefore disabled. Texture features are
         # always computed after isotropic 1 mm resampling by PyRadiomics.
@@ -469,6 +477,13 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
         self.radiomicsBinWidth = 10.0
         self.radiomicsNormalizeScale = 100.0
         self.radiomicsOutlierSigma = 3.0
+        # N4 bias-field correction is applied to a temporary radiomics copy
+        # BEFORE skull-masked z-score normalization. Shared_brainmask is used
+        # as the N4 mask so extracranial tissues do not drive the estimated field.
+        self.radiomicsUseN4BiasCorrection = True
+        self.radiomicsN4ShrinkFactor = 4
+        self.radiomicsN4Iterations = (50, 50, 30, 20)
+        self.radiomicsN4ConvergenceThreshold = 1e-6
         # Refined tumour ROIs should remain inside the conservative shared brain
         # mask. A tiny tolerance is allowed for rasterization/border effects.
         self.radiomicsMaxROIFractionOutsideBrain = 0.001
@@ -2703,6 +2718,106 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
 
         return maskNode, maskKJI.astype(bool, copy=False)
 
+    def _n4BiasCorrectRadiomicsArray(
+        self, imageNode, brainMaskNode, modality, workDir
+    ):
+        """Return an N4-corrected KJI array without modifying *_original.
+
+        N4 is estimated inside Shared_brainmask. A shrink factor is used only
+        for estimating the smooth bias field; the estimated field is then
+        reconstructed and applied on the full-resolution original grid.
+        Temporary NRRD files live in the radiomics working directory.
+        """
+        if not self.radiomicsUseN4BiasCorrection:
+            arrayKJI = np.asarray(
+                slicer.util.arrayFromVolume(imageNode), dtype=np.float32
+            )
+            return arrayKJI, {
+                "N4BiasCorrection": False,
+                "N4Mask": "",
+                "N4ShrinkFactor": "",
+                "N4Iterations": "",
+                "N4ConvergenceThreshold": "",
+            }
+
+        try:
+            import SimpleITK as sitk
+        except ImportError as exc:
+            raise RuntimeError(
+                "SimpleITK non disponibile: N4 bias field correction e' "
+                "obbligatoria nella pipeline radiomica standardizzata."
+            ) from exc
+
+        safeModality = self._safeName(modality)
+        inputPath = os.path.join(workDir, f"{safeModality}_n4_input.nrrd")
+        maskPath = os.path.join(workDir, f"{safeModality}_n4_brainmask.nrrd")
+
+        if not slicer.util.saveNode(imageNode, inputPath):
+            raise RuntimeError(
+                f"Impossibile salvare input temporaneo N4 per {modality}: {inputPath}"
+            )
+        if not slicer.util.saveNode(brainMaskNode, maskPath):
+            raise RuntimeError(
+                f"Impossibile salvare brain mask temporanea N4 per {modality}: {maskPath}"
+            )
+
+        image = sitk.ReadImage(inputPath, sitk.sitkFloat32)
+        mask = sitk.ReadImage(maskPath)
+        mask = sitk.Cast(mask > 0, sitk.sitkUInt8)
+
+        shrinkFactor = max(1, int(self.radiomicsN4ShrinkFactor))
+        if shrinkFactor > 1:
+            factors = [shrinkFactor] * image.GetDimension()
+            imageForN4 = sitk.Shrink(image, factors)
+            maskForN4 = sitk.Shrink(mask, factors)
+        else:
+            imageForN4 = image
+            maskForN4 = mask
+
+        corrector = sitk.N4BiasFieldCorrectionImageFilter()
+        corrector.SetMaximumNumberOfIterations(
+            [int(v) for v in self.radiomicsN4Iterations]
+        )
+        corrector.SetConvergenceThreshold(
+            float(self.radiomicsN4ConvergenceThreshold)
+        )
+
+        try:
+            _ = corrector.Execute(imageForN4, maskForN4)
+        except Exception as exc:
+            raise RuntimeError(
+                f"N4 bias field correction fallita per {modality}: {exc}"
+            ) from exc
+
+        # Reconstruct the estimated log-bias field on the FULL original grid,
+        # then correct the full-resolution image. This avoids feeding the
+        # downsampled N4 image into subsequent radiomics preprocessing.
+        logBiasField = corrector.GetLogBiasFieldAsImage(image)
+        corrected = image / sitk.Exp(logBiasField)
+        correctedKJI = sitk.GetArrayFromImage(corrected).astype(
+            np.float32, copy=False
+        )
+
+        originalKJI = np.asarray(
+            slicer.util.arrayFromVolume(imageNode), dtype=np.float32
+        )
+        if correctedKJI.shape != originalKJI.shape:
+            raise RuntimeError(
+                f"N4 ha modificato la shape di {modality}: "
+                f"{correctedKJI.shape} vs {originalKJI.shape}."
+            )
+
+        stats = {
+            "N4BiasCorrection": True,
+            "N4Mask": "Shared_brainmask",
+            "N4ShrinkFactor": shrinkFactor,
+            "N4Iterations": str(tuple(int(v) for v in self.radiomicsN4Iterations)),
+            "N4ConvergenceThreshold": float(
+                self.radiomicsN4ConvergenceThreshold
+            ),
+        }
+        return correctedKJI, stats
+
     def _normalizeRadiomicsArray(self, array, brainMask):
         """Skull-strip a copy, then normalize intensities inside brain only.
 
@@ -2766,14 +2881,17 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
         }
         return output, stats
 
-    def _prepareRadiomicsNormalizedNode(self, imageNode, modality, brainMaskKJI):
-        arrayKJI = np.asarray(
-            slicer.util.arrayFromVolume(imageNode), dtype=np.float32
+    def _prepareRadiomicsNormalizedNode(
+        self, imageNode, modality, brainMaskNode, brainMaskKJI, workDir
+    ):
+        correctedKJI, n4Stats = self._n4BiasCorrectRadiomicsArray(
+            imageNode, brainMaskNode, modality, workDir
         )
         normalizedKJI, stats = self._normalizeRadiomicsArray(
-            arrayKJI, brainMaskKJI
+            correctedKJI, brainMaskKJI
         )
-        nodeName = f"__RADIOMICS_{modality}_BRAIN_NORMALIZED"
+        stats.update(n4Stats)
+        nodeName = f"__RADIOMICS_{modality}_N4_BRAIN_NORMALIZED"
         normalizedNode = self._copyVolumeToNode(
             imageNode, nodeName, normalizedKJI
         )
@@ -2868,7 +2986,7 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
 
             # Brain mask is defined once on the common *_original/T1CE grid and
             # reused identically for all four MRI modalities.
-            _, brainMaskKJI = self._radiomicsBrainMaskArray(
+            brainMaskNode, brainMaskKJI = self._radiomicsBrainMaskArray(
                 image_nodes["T1CE"]
             )
 
@@ -2902,7 +3020,7 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
                     )
                     normalizedNode, normalizationStats = (
                         self._prepareRadiomicsNormalizedNode(
-                            imageNode, modality, brainMaskKJI
+                            imageNode, modality, brainMaskNode, brainMaskKJI, workDir
                         )
                     )
 
@@ -3081,6 +3199,8 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
                 "OriginalSpacing", "RadiomicsTargetSpacing",
                 "MaskVoxelCountOriginalGrid", "MaskVolumeMM3OriginalGrid",
                 "ROIVoxelsOutsideBrainMask", "ROIFractionOutsideBrainMask",
+                "N4BiasCorrection", "N4Mask", "N4ShrinkFactor",
+                "N4Iterations", "N4ConvergenceThreshold",
                 "NormalizationMask", "SkullStrippingBeforeNormalization",
                 "BrainMaskVoxelCount", "NormalizationMean", "NormalizationStd",
                 "NormalizationVoxelCount",
@@ -3118,9 +3238,14 @@ class CustomInferenceModulesLogic(ScriptedLoadableModuleLogic):
             qcSheet.append(["Image inputs", "T1_original,T2_original,T1CE_original,FLAIR_original"])
             qcSheet.append(["Segmentation", segmentationNode.GetName()])
             qcSheet.append(["Radiomics image source", "registered *_original volumes"])
+            qcSheet.append(["N4 bias field correction", bool(self.radiomicsUseN4BiasCorrection)])
+            qcSheet.append(["N4 mask", "Shared_brainmask"])
+            qcSheet.append(["N4 shrink factor", int(self.radiomicsN4ShrinkFactor)])
+            qcSheet.append(["N4 iterations", str(tuple(self.radiomicsN4Iterations))])
+            qcSheet.append(["N4 convergence threshold", float(self.radiomicsN4ConvergenceThreshold)])
             qcSheet.append(["Skull stripping before normalization", True])
             qcSheet.append(["Normalization mask", "Shared_brainmask"])
-            qcSheet.append(["Intensity normalization", "brain-mask finite non-zero z-score; clipped; scaled"])
+            qcSheet.append(["Intensity normalization", "N4-corrected; brain-mask finite non-zero z-score; clipped; scaled"])
             qcSheet.append(["Original volumes modified", False])
             qcSheet.append(["Normalization scale", float(self.radiomicsNormalizeScale)])
             qcSheet.append(["Outlier sigma", float(self.radiomicsOutlierSigma)])
